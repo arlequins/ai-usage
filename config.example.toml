@@ -1,10 +1,10 @@
 [slack]
 webhook_url_env = "AI_USAGE_SLACK_WEBHOOK_URL"
 
-# Optional adapters. Each command must write valid JSON to stdout.
+# Optional adapters that override built-in Claude and Codex collectors.
+# Each command must write valid JSON to stdout.
 # [commands.codex]
 # argv = ["my-codex-usage-exporter", "--json"]
 #
 # [commands.cursor]
 # argv = ["my-cursor-usage-exporter", "--json"]
-

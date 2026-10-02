@@ -6,8 +6,8 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 
 | Service | Built-in source | Notes |
 | --- | --- | --- |
-| Claude Code | `ccusage blocks --json` and `ccusage weekly --json` | Reads local Claude Code logs. These are activity/token/cost reports; they are **not** official plan quota or remaining-limit values. |
-| Codex | Configured JSON command, or a manual snapshot | The Codex CLI `/status` is interactive. This tool does not extract private login tokens or call undocumented quota endpoints. |
+| Claude Code | `ccusage claude blocks --json` and `ccusage claude weekly --json` | Reads local Claude Code logs. These are activity/token/cost reports; they are **not** official plan quota or remaining-limit values. |
+| Codex | `ccusage codex weekly --json` | Reads local Codex logs for activity/token/cost. This is not the official plan quota or remaining-limit value. The Codex CLI `/status` is interactive. |
 | Cursor | Manual snapshot | Team Admin API requires an API key and appropriate admin access. This setup does not use it. |
 
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:

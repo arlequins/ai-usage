@@ -70,12 +70,26 @@ def snapshot(label: str) -> dict[str, Any] | None:
 
 def claude_data() -> dict[str, Any]:
     try:
-        blocks = command_json(["ccusage", "blocks", "--json"])
-        weekly = command_json(["ccusage", "weekly", "--json"])
+        blocks = command_json(["ccusage", "claude", "blocks", "--json"])
+        weekly = command_json(["ccusage", "claude", "weekly", "--json"])
         return {
             "source": "ccusage local logs (activity, not plan quota)",
             "captured_at": now().isoformat(timespec="minutes"),
             "blocks": blocks,
+            "weekly": weekly,
+        }
+    except FileNotFoundError:
+        return {"source": "unavailable", "error": "ccusage is not installed"}
+    except (subprocess.TimeoutExpired, RuntimeError) as e:
+        return {"source": "unavailable", "error": str(e)}
+
+
+def codex_data() -> dict[str, Any]:
+    try:
+        weekly = command_json(["ccusage", "codex", "weekly", "--json"])
+        return {
+            "source": "ccusage local logs (activity, not plan quota)",
+            "captured_at": now().isoformat(timespec="minutes"),
             "weekly": weekly,
         }
     except FileNotFoundError:
@@ -94,6 +108,8 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
         data = configured or snapshot(service)
         if service == "claude" and data is None:
             data = claude_data()
+        if service == "codex" and data is None:
+            data = codex_data()
         if data is None:
             data = {"source": "not configured", "status": "No automatic source or snapshot is configured."}
         result["services"][service] = data
@@ -138,9 +154,10 @@ def render(report: dict[str, Any]) -> str:
         if data.get("status"):
             lines.append(f"  {data['status']}")
             continue
-        if service == "claude" and "blocks" in data:
-            lines.append("  Recent block activity:")
-            lines.extend(f"    {line}" for line in summarize(data["blocks"]))
+        if service in ("claude", "codex") and "weekly" in data:
+            if "blocks" in data:
+                lines.append("  Recent block activity:")
+                lines.extend(f"    {line}" for line in summarize(data["blocks"]))
             lines.append("  Weekly activity:")
             lines.extend(f"    {line}" for line in summarize(data["weekly"]))
         else:
