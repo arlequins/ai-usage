@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
 import os
@@ -117,7 +118,7 @@ def cursor_data() -> dict[str, Any]:
     if not session_token:
         return {
             "source": "not configured",
-            "status": "Set CURSOR_SESSION_TOKEN to read Cursor plan usage from your dashboard session.",
+            "status": "Cursor User API keys are for Cloud Agents, not IDE plan usage. Enable Cursor in CodexBar or configure a signed-in dashboard session.",
         }
 
     req = urllib.request.Request(
@@ -141,19 +142,23 @@ def cursor_data() -> dict[str, Any]:
     }
 
 
-def codexbar_data() -> dict[str, Any] | None:
-    """Read quota windows and pacing from CodexBar when it is installed."""
+def codexbar_executable() -> str | None:
     candidates = [
         shutil.which("codexbar"),
         "/opt/homebrew/bin/codexbar",
         "/usr/local/bin/codexbar",
         "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
     ]
-    executable = next((path for path in candidates if path and Path(path).is_file()), None)
+    return next((path for path in candidates if path and Path(path).is_file()), None)
+
+
+def codexbar_data() -> dict[str, Any] | None:
+    """Read quota windows and pacing from CodexBar when it is installed."""
+    executable = codexbar_executable()
     if not executable:
         return None
     try:
-        return command_json([executable, "dashboard", "--identity", "redacted"], timeout=60)
+        return command_json([executable, "dashboard", "--identity", "redacted"], timeout=15)
     except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
         return {"error": str(e)}
 
@@ -168,68 +173,49 @@ def quota_rows(snapshot: Any) -> dict[str, dict[str, Any]]:
     }
 
 
-def codexbar_pace(executable: str, provider: str) -> list[str]:
+def service_data(service: str, config: dict[str, Any]) -> dict[str, Any]:
     try:
-        proc = subprocess.run(
-            [executable, "usage", "--provider", provider, "--no-color"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if proc.returncode:
-        return []
-    lines = []
-    window_label = "Usage"
-    for raw in proc.stdout.splitlines():
-        line = raw.strip()
-        if line.startswith(("Session:", "Weekly:", "Monthly:", "Auto:", "API:", "5-hour:")):
-            window_label = line.partition(":")[0]
-        elif line.startswith("Pace:"):
-            detail = line.partition(":")[2].strip()
-            if detail:
-                lines.append(f"{window_label}: {detail}")
-            window_label = "Usage"
-    return lines
+        configured = run_configured(service, config)
+    except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
+        configured = {"source": "configured command failed", "error": str(e)}
+    if service == "cursor" and not configured and setting("CURSOR_SESSION_TOKEN"):
+        data = cursor_data()
+    else:
+        data = configured or snapshot(service)
+    if service == "claude" and data is None:
+        data = claude_data()
+    elif service == "codex" and data is None:
+        data = codex_data()
+    elif service == "cursor" and data is None:
+        data = cursor_data()
+    return data or {"source": "not configured", "status": "No automatic source or snapshot is configured."}
+
+
+def has_quota_data(row: dict[str, Any]) -> bool:
+    windows = row.get("windows")
+    return bool(
+        (isinstance(windows, list) and any(isinstance(window, dict) and not window.get("idle") for window in windows))
+        or row.get("pace")
+        or row.get("credits")
+    )
 
 
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"generated_at": now().isoformat(timespec="minutes"), "services": {}}
-    quota_snapshot = codexbar_data()
+    # The providers are independent. Run local log scans and the optional quota
+    # snapshot concurrently so one slow source does not add to every other wait.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        quota_future = pool.submit(codexbar_data)
+        service_futures = {
+            service: pool.submit(service_data, service, config)
+            for service in ("claude", "codex", "cursor")
+        }
+        quota_snapshot = quota_future.result()
+        service_results = {service: future.result() for service, future in service_futures.items()}
     quotas = quota_rows(quota_snapshot)
-    if isinstance(quota_snapshot, dict) and not quota_snapshot.get("error"):
-        candidates = [
-            shutil.which("codexbar"),
-            "/opt/homebrew/bin/codexbar",
-            "/usr/local/bin/codexbar",
-            "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
-        ]
-        executable = next((path for path in candidates if path and Path(path).is_file()), None)
-        if executable:
-            for provider in quotas:
-                summaries = codexbar_pace(executable, provider)
-                if summaries:
-                    quotas[provider]["paceSummaries"] = summaries
     for service in ("claude", "codex", "cursor"):
-        try:
-            configured = run_configured(service, config)
-        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
-            configured = {"source": "configured command failed", "error": str(e)}
-        if service == "cursor" and not configured and setting("CURSOR_SESSION_TOKEN"):
-            data = cursor_data()
-        else:
-            data = configured or snapshot(service)
-        if service == "claude" and data is None:
-            data = claude_data()
-        if service == "codex" and data is None:
-            data = codex_data()
-        if service == "cursor" and data is None:
-            data = cursor_data()
-        if data is None:
-            data = {"source": "not configured", "status": "No automatic source or snapshot is configured."}
-        if service in quotas:
+        data = service_results[service]
+        if service in quotas and has_quota_data(quotas[service]):
             data["quota"] = quotas[service]
             data["quota_source"] = "CodexBar"
         elif isinstance(quota_snapshot, dict) and quota_snapshot.get("error"):
@@ -237,7 +223,7 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
         elif quota_snapshot is None:
             data["quota_status"] = "CodexBar CLI is not installed; plan limits and pace forecasts are unavailable."
         else:
-            data["quota_status"] = "Provider is not enabled or returned no quota data in CodexBar."
+            data["quota_status"] = "No quota data returned. Enable and sign in to this provider in CodexBar."
         result["services"][service] = data
     return result
 
@@ -354,8 +340,11 @@ def render(report: dict[str, Any]) -> str:
     titles = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
     for service, title in titles.items():
         data = report["services"][service]
-        lines.append(f"\n{title} · {data.get('source', 'unknown')}")
         quota = data.get("quota")
+        source = data.get("source", "unknown")
+        if isinstance(quota, dict) and source == "not configured":
+            source = "CodexBar quota"
+        lines.append(f"\n{title} · {source}")
         if isinstance(quota, dict):
             lines.append("  Quota and pace · CodexBar")
             lines.extend(render_quota(quota))
@@ -364,7 +353,7 @@ def render(report: dict[str, Any]) -> str:
         if data.get("error"):
             lines.append(f"  ⚠ {data['error']}")
             continue
-        if data.get("status"):
+        if data.get("status") and not quota:
             lines.append(f"  {data['status']}")
             continue
         if service == "cursor" and "usage" in data and not quota:
