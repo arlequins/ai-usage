@@ -1118,15 +1118,15 @@ def render_slack(report: dict[str, Any], language: str = "en") -> str:
         hours, value = divmod(value, 3600)
         minutes = value // 60
         if days:
-            return f"{days}일 {hours}시간"
+            return f"{days}日 {hours}時間"
         if hours:
-            return f"{hours}시간 {minutes}분"
-        return f"{minutes}분"
+            return f"{hours}時間 {minutes}分"
+        return f"{minutes}分"
 
     generated = parsed_time(report.get("generated_at")) or now()
     local_stamp = generated.astimezone()
     stamp = (
-        f"{local_stamp.month}월 {local_stamp.day}일 {local_stamp:%H:%M}"
+        f"{local_stamp.month}月 {local_stamp.day}日 {local_stamp:%H:%M}"
         if language == "ja" else local_stamp.strftime("%b %d, %H:%M")
     )
     heading = "🤖 AI利用状況" if language == "ja" else "🤖 AI Usage"
@@ -1140,7 +1140,7 @@ def render_slack(report: dict[str, Any], language: str = "en") -> str:
         windows = [window for window in windows if isinstance(window, dict)] if isinstance(windows, list) else []
 
         if service in ("claude", "codex") and windows:
-            short_label = "5시간" if language == "ja" else "5h"
+            short_label = "5時間" if language == "ja" else "5h"
             weekly_label = "週間" if language == "ja" else "weekly"
             primary = next((w for w in windows if w.get("label") in ("5-hour", "Session")), None)
             weekly = next((w for w in windows if w.get("label") == "Weekly"), None)
