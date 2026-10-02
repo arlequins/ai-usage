@@ -6,11 +6,13 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 
 | Service | Built-in source | Notes |
 | --- | --- | --- |
-| Claude Code | `ccusage claude blocks --json` and `ccusage claude weekly --json` | Reads local Claude Code logs. These are activity/token/cost reports; they are **not** official plan quota or remaining-limit values. |
+| Claude Code | Local `ccusage` logs and the Claude Code OAuth usage endpoint | Shows plan utilization/reset windows when a valid local OAuth token is available, plus local activity/token/cost reports. The usage endpoint is undocumented. |
 | Codex | `ccusage codex daily --json` and Codex CLI `app-server` | Shows local activity plus account rate-limit windows and reset times from the signed-in Codex CLI session. |
 | Cursor | Cursor.app local session plus dashboard `GET /api/usage-summary` | Reads the existing Cursor login token from the local app database, then reports IDE plan usage pools and billing cycle. The endpoint and token format are undocumented and may change. |
 
-The terminal and Slack use the same compact report. Provider quota/reset information is shown separately from `ccusage` local activity; estimated token costs are not plan balances or invoices. Claude Code currently reports local activity only. When a local activity total is unusually large, the report flags it for review instead of presenting it as quota consumption.
+The terminal and Slack use the same compact report. Provider quota/reset information is shown separately from `ccusage` local activity; estimated token costs are not plan balances or invoices. For quota windows with known duration, `ai-usage` estimates whether the current average consumption rate could exhaust the limit before reset. This is a projection from one usage snapshot and assumes a steady rate; it is not a guarantee. When a local activity total is unusually large, the report flags it for review instead of presenting it as quota consumption.
+
+Claude Code quota is read from the same undocumented OAuth usage endpoint used by its `/usage` view. `ai-usage` reads the current access token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`) and sends it to `api.anthropic.com`. It does not refresh or write credentials. If the token is expired, open Claude Code to refresh sign-in before running `ai-usage` again. This endpoint can change or rate-limit requests.
 
 Codex quota is requested from the locally installed Codex CLI, or the CLI bundled with the ChatGPT macOS app, using its `app-server` protocol with read-only sandbox and no approval prompts. `ai-usage` does not read or refresh Codex credentials itself. Codex must be installed and signed in for quota windows to appear. The quota request runs alongside activity collection and has a 15-second timeout.
 
@@ -85,6 +87,7 @@ Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with th
 
 - Local source: `~/.claude` usage logs through `ccusage` (ccusage must be installed separately).
 - Manual snapshots and config stay on the Mac.
+- Claude quota collection reads the current OAuth access token without printing it, storing it, or refreshing it; the token is sent only to `api.anthropic.com` for the undocumented usage request.
 - Codex quota collection uses the Codex CLI app-server read-only request and its existing sign-in.
 - Cursor usage collection reads the local Cursor app session database in read-only mode and calls an undocumented dashboard endpoint. Its session token is sensitive and remains in memory only.
 - No Cursor User API key is used; those keys currently serve Cloud Agent API access rather than IDE plan usage.

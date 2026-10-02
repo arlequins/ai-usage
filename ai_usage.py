@@ -108,6 +108,95 @@ def claude_data() -> dict[str, Any]:
         return {"source": "unavailable", "error": str(e)}
 
 
+def claude_quota_data() -> dict[str, Any]:
+    """Read Claude Code plan limits using its current OAuth token, without refreshing it."""
+    credentials_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
+    credentials_path = credentials_dir / ".credentials.json"
+    try:
+        credentials = json.loads(credentials_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": "Claude Code OAuth credentials were not found. Sign in to Claude Code first."}
+    oauth = credentials.get("claudeAiOauth", {}) if isinstance(credentials, dict) else {}
+    access_token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    expires_at = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    if not isinstance(access_token, str) or not access_token:
+        return {"error": "Claude Code OAuth token was not found in its local credentials."}
+    if isinstance(expires_at, (int, float)) and expires_at <= dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + 60_000:
+        return {"error": "Claude Code OAuth token is expired or nearly expired. Open Claude Code to refresh sign-in."}
+
+    request = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={"Authorization": f"Bearer {access_token}", "anthropic-beta": "oauth-2025-04-20"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            usage = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"error": "Anthropic rejected the Claude Code session. Open Claude Code to refresh sign-in."}
+        if e.code == 429:
+            return {"error": "Anthropic temporarily rate-limited the usage request. Try again later."}
+        return {"error": f"Claude usage request failed: HTTP {e.code} {e.reason}"}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        return {"error": f"Claude usage request failed: {e}"}
+    if not isinstance(usage, dict):
+        return {"error": "Claude returned an unexpected usage response."}
+
+    windows: list[dict[str, Any]] = []
+    limits = usage.get("limits")
+    if isinstance(limits, list) and limits:
+        for limit in limits:
+            if not isinstance(limit, dict):
+                continue
+            kind = limit.get("kind")
+            scope = limit.get("scope")
+            model = scope.get("model", {}) if isinstance(scope, dict) else {}
+            model_name = model.get("display_name") if isinstance(model, dict) else None
+            if kind == "session":
+                label, seconds = "5-hour", 5 * 3600
+            elif kind == "weekly_all":
+                label, seconds = "Weekly", 7 * 24 * 3600
+            elif kind == "weekly_scoped":
+                label, seconds = f"Weekly ({model_name})" if model_name else "Weekly (model)", 7 * 24 * 3600
+            else:
+                continue
+            window = quota_window(label, limit.get("percent"), limit.get("resets_at"), seconds)
+            if window:
+                windows.append(window)
+    else:
+        for key, label, seconds in (
+            ("five_hour", "5-hour", 5 * 3600),
+            ("seven_day", "Weekly", 7 * 24 * 3600),
+            ("seven_day_sonnet", "Weekly (Sonnet)", 7 * 24 * 3600),
+            ("seven_day_opus", "Weekly (Opus)", 7 * 24 * 3600),
+        ):
+            bucket = usage.get(key)
+            if isinstance(bucket, dict):
+                window = quota_window(label, bucket.get("utilization"), bucket.get("resets_at"), seconds)
+                if window:
+                    windows.append(window)
+    if not windows:
+        return {"error": "Claude returned no plan usage windows for this account."}
+
+    quota: dict[str, Any] = {"windows": windows}
+    plan = (oauth.get("subscriptionType") or oauth.get("rateLimitTier")) if isinstance(oauth, dict) else None
+    if plan:
+        quota["identity"] = {"plan": plan}
+    return {"quota": quota, "source": "Claude Code usage endpoint (unofficial)"}
+
+
+def quota_window(label: str, used: Any, reset_at: Any, duration_seconds: int) -> dict[str, Any] | None:
+    if not isinstance(used, (int, float)) or isinstance(used, bool):
+        return None
+    return {
+        "label": label,
+        "usedPercent": used,
+        "remainingPercent": max(0, 100 - used),
+        "resetAt": reset_at,
+        "windowDurationSeconds": duration_seconds,
+    }
+
+
 def codex_data() -> dict[str, Any]:
     try:
         daily = command_json(["ccusage", "codex", "daily", "--json"])
@@ -344,7 +433,13 @@ def normalize_codex_quota(payload: dict[str, Any]) -> dict[str, Any]:
         reset_at = limit.get("resetsAt")
         if isinstance(reset_at, (int, float)):
             reset_at = dt.datetime.fromtimestamp(reset_at, dt.timezone.utc).isoformat()
-        windows.append({"label": label, "usedPercent": used, "remainingPercent": max(0, 100 - used), "resetAt": reset_at})
+        windows.append({
+            "label": label,
+            "usedPercent": used,
+            "remainingPercent": max(0, 100 - used),
+            "resetAt": reset_at,
+            "windowDurationSeconds": int(minutes * 60) if isinstance(minutes, (int, float)) else None,
+        })
     if not windows:
         return {"error": "Codex is signed in, but no plan quota windows were returned."}
     snapshot: dict[str, Any] = {"windows": windows}
@@ -377,19 +472,26 @@ def service_data(service: str, config: dict[str, Any]) -> dict[str, Any]:
 
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"generated_at": now().isoformat(timespec="minutes"), "services": {}}
-    # Run local activity scans and the Codex quota request concurrently.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        quota_future = pool.submit(codex_quota_data)
+    # Run local activity scans and provider quota requests concurrently.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        quota_futures = {
+            "claude": pool.submit(claude_quota_data),
+            "codex": pool.submit(codex_quota_data),
+        }
         service_futures = {
             service: pool.submit(service_data, service, config)
             for service in ("claude", "codex", "cursor")
         }
-        quota_snapshot = quota_future.result()
+        quota_snapshots = {service: future.result() for service, future in quota_futures.items()}
         service_results = {service: future.result() for service, future in service_futures.items()}
     for service in ("claude", "codex", "cursor"):
         data = service_results[service]
-        if service == "codex":
-            if quota_snapshot.get("windows"):
+        if service in quota_snapshots:
+            quota_snapshot = quota_snapshots[service]
+            if quota_snapshot.get("quota", {}).get("windows"):
+                data["quota"] = quota_snapshot["quota"]
+                data["quota_source"] = quota_snapshot.get("source", "provider")
+            elif quota_snapshot.get("windows"):
                 data["quota"] = quota_snapshot
                 data["quota_source"] = "Codex app-server"
             elif quota_snapshot.get("error"):
@@ -561,6 +663,36 @@ def reset_label(value: Any) -> str | None:
         return value
 
 
+def parsed_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=dt.timezone.utc) if parsed.tzinfo is None else parsed
+    except ValueError:
+        return None
+
+
+def pace_assessment(used_percent: Any, reset_at: Any, duration_seconds: Any) -> str | None:
+    """Estimate whether the current average usage pace lasts to the reset."""
+    if not isinstance(used_percent, (int, float)) or isinstance(used_percent, bool):
+        return None
+    reset = parsed_time(reset_at)
+    if not reset or not isinstance(duration_seconds, (int, float)):
+        return None
+    seconds_to_reset = (reset - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    elapsed = duration_seconds - seconds_to_reset
+    if seconds_to_reset <= 0 or elapsed < 60:
+        return None
+    used = max(0.0, min(100.0, float(used_percent)))
+    if used == 0:
+        return f"✓ Pace: no quota used yet; reset in {duration(seconds_to_reset)}"
+    estimated_empty = max(0.0, (100 - used) * elapsed / used)
+    if estimated_empty < seconds_to_reset:
+        return f"⚠ Pace: could run out in {duration(estimated_empty)} at the current rate"
+    return f"✓ Pace: likely enough through reset ({duration(seconds_to_reset)} left)"
+
+
 def render_quota(row: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     windows = row.get("windows", [])
@@ -579,6 +711,9 @@ def render_quota(row: dict[str, Any]) -> list[str]:
         reset = reset_label(window.get("resetAt"))
         if reset:
             lines.append(f"  Reset      {reset}")
+        pace = pace_assessment(used, window.get("resetAt"), window.get("windowDurationSeconds"))
+        if pace:
+            lines.append(f"  {pace}")
 
     pace = row.get("pace")
     if isinstance(pace, dict):
@@ -663,6 +798,16 @@ def render(report: dict[str, Any]) -> str:
                     percent = plan.get(key)
                     if isinstance(percent, (int, float)):
                         lines.append(f"  {name}: {100 - percent:.1f}% remaining")
+                        if key == "totalPercentUsed":
+                            remaining_percent = max(0, min(100, 100 - percent))
+                            lines.append(f"  Included   {progress_bar(remaining_percent)}  {remaining_percent:.1f}% remaining")
+                cycle_start = parsed_time(usage.get("billingCycleStart"))
+                cycle_end = parsed_time(usage.get("billingCycleEnd"))
+                if cycle_start and cycle_end:
+                    cycle_seconds = (cycle_end - cycle_start).total_seconds()
+                    pace = pace_assessment(plan.get("totalPercentUsed"), usage.get("billingCycleEnd"), cycle_seconds)
+                    if pace:
+                        lines.append(f"  {pace}")
             if usage.get("billingCycleStart") or usage.get("billingCycleEnd"):
                 lines.append(f"  Billing cycle: {usage.get('billingCycleStart', '?')} → {usage.get('billingCycleEnd', '?')}")
             on_demand = usage.get("individualUsage", {}).get("onDemand", {})
