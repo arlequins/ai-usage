@@ -1,5 +1,7 @@
 [slack]
 language = "en" # Supported: en, ja
+mention_name = "@Wonho An"
+mention_user_id_env = "AI_USAGE_SLACK_MENTION_USER_ID"
 bot_token_env = "AI_USAGE_SLACK_BOT_TOKEN"
 channel_env = "AI_USAGE_SLACK_CHANNEL"
 webhook_url_env = "AI_USAGE_SLACK_WEBHOOK_URL"

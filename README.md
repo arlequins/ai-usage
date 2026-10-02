@@ -69,6 +69,8 @@ Slack messages contain a compact summary of Claude's weekly usage and Cursor's u
 language = "ja" # Use "en" for English
 ```
 
+The message includes `@Wonho An` by default. To notify the user with a real Slack mention, save the member ID in `~/.config/ai-usage/environment` as `AI_USAGE_SLACK_MENTION_USER_ID=U...`. In Slack, open the user's profile, select **More**, then **Copy member ID**. The ID overrides the display name and is kept out of the repository.
+
 Incoming Webhooks are also supported as an alternative. Add a Slack Incoming Webhook URL to `~/.config/ai-usage/config.toml`:
 
 ```toml

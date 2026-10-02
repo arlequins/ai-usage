@@ -1092,7 +1092,12 @@ def render(report: dict[str, Any], color: bool = False) -> str:
     return "\n".join(lines)
 
 
-def render_slack(report: dict[str, Any], language: str = "en") -> str:
+def render_slack(
+    report: dict[str, Any],
+    language: str = "en",
+    mention_name: str = "@Wonho An",
+    mention_user_id: str = "",
+) -> str:
     """Render a concise Slack summary with quota usage and reset timing."""
     if language not in ("en", "ja"):
         raise RuntimeError("Slack language must be 'en' or 'ja'")
@@ -1139,7 +1144,8 @@ def render_slack(report: dict[str, Any], language: str = "en") -> str:
         if language == "ja" else local_stamp.strftime("%b %d, %H:%M")
     )
     heading = "🤖 AI利用状況" if language == "ja" else "🤖 AI Usage"
-    lines = [f"*{heading}* · {stamp}"]
+    mention = f"<@{mention_user_id}>" if mention_user_id else mention_name
+    lines = [f"*{heading}* · {stamp} · {mention}"]
     services = report.get("services", {})
 
     claude = services.get("claude", {}) if isinstance(services, dict) else {}
@@ -1306,14 +1312,32 @@ def main(argv: list[str] | None = None) -> int:
         print(message)
         if args.slack:
             try:
-                post_slack(render_slack(report, config.get("slack", {}).get("language", "en")), config)
+                slack_config = config.get("slack", {})
+                post_slack(
+                    render_slack(
+                        report,
+                        slack_config.get("language", "en"),
+                        slack_config.get("mention_name", "@Wonho An"),
+                        setting(slack_config.get("mention_user_id_env", "AI_USAGE_SLACK_MENTION_USER_ID")),
+                    ),
+                    config,
+                )
                 print("\nSent to Slack")
             except RuntimeError as e:
                 print(f"\nai-usage: {e}", file=sys.stderr)
                 return 1
     if args.json and args.slack:
         try:
-            post_slack(render_slack(report, config.get("slack", {}).get("language", "en")), config)
+            slack_config = config.get("slack", {})
+            post_slack(
+                render_slack(
+                    report,
+                    slack_config.get("language", "en"),
+                    slack_config.get("mention_name", "@Wonho An"),
+                    setting(slack_config.get("mention_user_id_env", "AI_USAGE_SLACK_MENTION_USER_ID")),
+                ),
+                config,
+            )
         except RuntimeError as e:
             print(f"ai-usage: {e}", file=sys.stderr)
             return 1
