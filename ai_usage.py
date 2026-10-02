@@ -113,40 +113,48 @@ def codex_data() -> dict[str, Any]:
 
 
 def cursor_data() -> dict[str, Any]:
-    api_key = setting("CURSOR_ADMIN_API_KEY")
-    email = setting("CURSOR_USER_EMAIL")
+    api_key = setting("CURSOR_API_KEY") or setting("CURSOR_ADMIN_API_KEY")
     if not api_key:
-        return {"source": "not configured", "status": "Set CURSOR_ADMIN_API_KEY to enable Cursor Team API."}
-    if not email:
-        return {"source": "not configured", "status": "Set CURSOR_USER_EMAIL to filter your own team usage."}
-    body = json.dumps({"searchTerm": email, "page": 1, "pageSize": 100}).encode()
-    auth = base64.b64encode(f"{api_key}:".encode()).decode()
-    req = urllib.request.Request(
-        "https://api.cursor.com/teams/spend",
-        data=body,
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
+        return {"source": "not configured", "status": "Set CURSOR_API_KEY to enable Cursor User API."}
+
+    def get_json(path: str) -> Any:
+        req = urllib.request.Request(
+            f"https://api.cursor.com{path}",
+            headers={"Authorization": f"Basic {base64.b64encode(f'{api_key}:'.encode()).decode()}"},
+        )
         with urllib.request.urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode())
+            return json.loads(response.read().decode())
+
+    try:
+        identity = get_json("/v1/me")
+        agents = get_json("/v1/agents?limit=20&includeArchived=true")
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"source": "Cursor User API", "error": "Cursor rejected the API key. Check that it is the User API key shown in Cursor Dashboard → API & SSH Keys."}
+        return {"source": "Cursor User API", "error": f"Cursor API request failed: HTTP {e.code} {e.reason}"}
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        return {"source": "Cursor Team Admin API", "error": f"Cursor API request failed: {e}"}
-    people = result.get("teamMemberSpend", [])
-    match = next((person for person in people if person.get("email", "").casefold() == email.casefold()), None)
-    if match is None:
-        return {"source": "Cursor Team Admin API", "error": f"No team member matched CURSOR_USER_EMAIL ({email}). Check the email and API key read scope."}
+        return {"source": "Cursor User API", "error": f"Cursor API request failed: {e}"}
+
+    totals = {"inputTokens": 0, "outputTokens": 0, "cacheWriteTokens": 0, "cacheReadTokens": 0, "totalTokens": 0}
+    scanned = 0
+    failed = 0
+    for agent in agents.get("items", []):
+        try:
+            usage = get_json(f"/v1/agents/{agent['id']}/usage").get("totalUsage", {})
+            for field in totals:
+                totals[field] += usage.get(field, 0) or 0
+            scanned += 1
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError):
+            failed += 1
     return {
-        "source": "Cursor Team Admin API · current billing cycle",
+        "source": "Cursor User API · Cloud Agent usage (latest 20 agents; not IDE plan usage)",
         "captured_at": now().isoformat(timespec="minutes"),
         "usage": {
-            "email": match.get("email"),
-            "on_demand_spend_cents": match.get("spendCents"),
-            "overall_spend_cents": match.get("overallSpendCents"),
-            "effective_limit_dollars": match.get("effectivePerUserLimitDollars"),
-            "monthly_limit_dollars": match.get("monthlyLimitDollars"),
-            "fast_premium_requests": match.get("fastPremiumRequests"),
-            "cycle_start": result.get("subscriptionCycleStart"),
+            "email": identity.get("userEmail", "unknown"),
+            "agents_scanned": scanned,
+            "more_agents_available": bool(agents.get("nextCursor")),
+            "agents_failed": failed,
+            **totals,
         },
     }
 
@@ -158,7 +166,7 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
             configured = run_configured(service, config)
         except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
             configured = {"source": "configured command failed", "error": str(e)}
-        if service == "cursor" and not configured and setting("CURSOR_ADMIN_API_KEY"):
+        if service == "cursor" and not configured and (setting("CURSOR_API_KEY") or setting("CURSOR_ADMIN_API_KEY")):
             data = cursor_data()
         else:
             data = configured or snapshot(service)
@@ -215,16 +223,15 @@ def render(report: dict[str, Any]) -> str:
         if service == "cursor" and "usage" in data:
             usage = data["usage"]
             lines.append(f"  Account: {usage['email']}")
-            if usage.get("on_demand_spend_cents") is not None:
-                lines.append(f"  On-demand spend: ${usage['on_demand_spend_cents'] / 100:.2f}")
-            if usage.get("overall_spend_cents") is not None:
-                lines.append(f"  Overall spend: ${usage['overall_spend_cents'] / 100:.2f}")
-            if usage.get("effective_limit_dollars") is not None:
-                lines.append(f"  Effective spend limit: ${usage['effective_limit_dollars']:.2f}")
-            if usage.get("monthly_limit_dollars") is not None:
-                lines.append(f"  Monthly spend limit: ${usage['monthly_limit_dollars']:.2f}")
-            if usage.get("fast_premium_requests") is not None:
-                lines.append(f"  Fast premium requests: {usage['fast_premium_requests']}")
+            lines.append(f"  Cloud agents scanned: {usage['agents_scanned']}")
+            lines.append(f"  Input tokens: {usage['inputTokens']}")
+            lines.append(f"  Output tokens: {usage['outputTokens']}")
+            lines.append(f"  Cache tokens: {usage['cacheWriteTokens'] + usage['cacheReadTokens']}")
+            lines.append(f"  Total tokens: {usage['totalTokens']}")
+            if usage.get("more_agents_available"):
+                lines.append("  Note: Only the 20 newest agents are included.")
+            if usage.get("agents_failed"):
+                lines.append(f"  Agents with unavailable usage: {usage['agents_failed']}")
             if data.get("captured_at"):
                 lines.append(f"  Captured: {data['captured_at']}")
             continue

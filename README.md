@@ -8,7 +8,7 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 | --- | --- | --- |
 | Claude Code | `ccusage claude blocks --json` and `ccusage claude weekly --json` | Reads local Claude Code logs. These are activity/token/cost reports; they are **not** official plan quota or remaining-limit values. |
 | Codex | `ccusage codex daily --json` | Reads local Codex logs for activity/token/cost. This is not the official plan quota or remaining-limit value. The Codex CLI `/status` is interactive. |
-| Cursor | Team Admin API `/teams/spend`, filtered to `CURSOR_USER_EMAIL` | Requires a Team API key with read access. Reports current-cycle spending and configured spending limits, not remaining included plan quota. |
+| Cursor | User API `/v1/me` and Cloud Agent usage endpoints | Reports token usage for the 20 newest Cloud Agents. It does not expose Cursor IDE usage or remaining plan allowance. |
 
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:
 
@@ -19,14 +19,13 @@ argv = ["my-codex-usage-exporter", "--json"]
 
 The command may return any JSON value; it is included in the report as returned. Do not put secrets in command arguments.
 
-For Cursor API collection, add these lines to `~/.config/ai-usage/environment`:
+For Cursor Cloud Agent collection, add the User API key from Cursor Dashboard → API & SSH Keys to `~/.config/ai-usage/environment`:
 
 ```sh
-CURSOR_ADMIN_API_KEY=your_cursor_team_api_key
-CURSOR_USER_EMAIL=you@example.com
+CURSOR_API_KEY=your_cursor_user_api_key
 ```
 
-Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. The collector requests the matching user's current-cycle spend row. Cursor's API returns spending and configured limits, not included plan quota remaining.
+Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. The User API key can list Cloud Agents and their token usage. Cursor's public documentation directs users to the Spending dashboard for included usage pools and remaining allowance; those values are not exposed by the documented User API endpoints.
 
 ## Install
 
@@ -76,7 +75,7 @@ ai-usage snapshot codex ~/Downloads/codex-usage.json
 ai-usage snapshot cursor ~/Downloads/cursor-usage.json
 ```
 
-Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with their capture time. They remain available if you do not have a Cursor Team API key; the application does not scrape browser sessions.
+Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with their capture time. They remain available if you want to record values from the Cursor Spending dashboard; the application does not scrape browser sessions.
 
 ## Data and security
 
