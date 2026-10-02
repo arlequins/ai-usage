@@ -635,6 +635,14 @@ def progress_bar(remaining: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def colorize(value: str, code: str, enabled: bool) -> str:
+    return f"\033[{code}m{value}\033[0m" if enabled else value
+
+
+def remaining_color(remaining: float) -> str:
+    return "32" if remaining >= 50 else "33" if remaining >= 20 else "31"
+
+
 def duration(seconds: float | int | None) -> str:
     if seconds is None:
         return "unknown"
@@ -693,7 +701,7 @@ def pace_assessment(used_percent: Any, reset_at: Any, duration_seconds: Any) -> 
     return f"✓ Pace: likely enough through reset ({duration(seconds_to_reset)} left)"
 
 
-def render_quota(row: dict[str, Any]) -> list[str]:
+def render_quota(row: dict[str, Any], color: bool = False) -> list[str]:
     lines: list[str] = []
     windows = row.get("windows", [])
     if not isinstance(windows, list):
@@ -707,13 +715,18 @@ def render_quota(row: dict[str, Any]) -> list[str]:
         if not isinstance(remaining, (int, float)) and isinstance(used, (int, float)):
             remaining = 100 - used
         if isinstance(remaining, (int, float)):
-            lines.append(f"  {label:<10} {progress_bar(remaining)}  {remaining:.0f}% remaining")
+            remaining = max(0, min(100, remaining))
+            code = remaining_color(remaining)
+            bar = colorize(progress_bar(remaining), code, color)
+            pct = colorize(f"{remaining:.0f}% left", code, color)
+            lines.append(f"    {label:<17} {bar}  {pct}")
         reset = reset_label(window.get("resetAt"))
         if reset:
-            lines.append(f"  Reset      {reset}")
+            lines.append(f"      ↻ Reset in {reset}")
         pace = pace_assessment(used, window.get("resetAt"), window.get("windowDurationSeconds"))
         if pace:
-            lines.append(f"  {pace}")
+            code = "31" if pace.startswith("⚠") else "32"
+            lines.append(f"      {colorize(pace, code, color)}")
 
     pace = row.get("pace")
     if isinstance(pace, dict):
@@ -725,60 +738,90 @@ def render_quota(row: dict[str, Any]) -> list[str]:
             eta = detail.get("etaSeconds")
             summary = detail.get("summary")
             if will_last is False and isinstance(eta, (int, float)):
-                lines.append(f"  ⚠ {label}: projected empty in {duration(eta)}")
+                lines.append(f"      ⚠ {label}: projected empty in {duration(eta)}")
             elif will_last is True:
-                lines.append(f"  ✓ {label}: pace is sufficient through reset")
+                lines.append(f"      ✓ {label}: pace is sufficient through reset")
             elif isinstance(summary, str) and summary:
-                lines.append(f"  {label}: {summary}")
+                lines.append(f"      {label}: {summary}")
     for summary in row.get("paceSummaries", []):
         if isinstance(summary, str):
-            lines.append(f"  Pace: {summary}")
+            lines.append(f"      Pace: {summary}")
 
     identity = row.get("identity")
     if isinstance(identity, dict) and identity.get("plan"):
-        lines.insert(0, f"  Plan       {identity['plan']}")
+        lines.insert(0, f"    Plan: {identity['plan']}")
     credits = row.get("credits")
     if isinstance(credits, dict) and credits.get("remaining") is not None:
-        unit = credits.get("unit", "credits")
-        lines.append(f"  Credits    {credits['remaining']} {unit} remaining")
+        lines.append(f"    Resets available: {credits['remaining']}")
     return lines
 
 
-def render(report: dict[str, Any]) -> str:
+def quota_summary(data: dict[str, Any], service: str) -> tuple[str, str]:
+    quota = data.get("quota")
+    windows = quota.get("windows", []) if isinstance(quota, dict) else []
+    if isinstance(windows, list) and windows:
+        remaining = [
+            window.get("remainingPercent") if isinstance(window.get("remainingPercent"), (int, float))
+            else 100 - window.get("usedPercent", 0)
+            for window in windows
+            if isinstance(window, dict) and isinstance(window.get("usedPercent"), (int, float))
+        ]
+        if remaining:
+            lowest = min(remaining)
+            state = "⚠ low" if lowest < 20 else "✓ available"
+            return f"{state} · {lowest:.0f}% min left", "31" if lowest < 20 else "32"
+    if service == "cursor":
+        usage = data.get("usage", {})
+        plan = usage.get("individualUsage", {}).get("plan", {}) if isinstance(usage, dict) else {}
+        used = plan.get("totalPercentUsed") if isinstance(plan, dict) else None
+        if isinstance(used, (int, float)):
+            remaining = max(0, 100 - used)
+            return f"{'⚠ low' if remaining < 20 else '✓ available'} · {remaining:.1f}% left", "31" if remaining < 20 else "32"
+    if data.get("quota_status"):
+        return "⚠ quota unavailable", "33"
+    if data.get("error"):
+        return "⚠ source unavailable", "33"
+    return "activity only", "36"
+
+
+def render(report: dict[str, Any], color: bool = False) -> str:
     stamp = dt.datetime.fromisoformat(report["generated_at"]).strftime("%Y-%m-%d %H:%M %Z")
-    lines = [f"🤖 AI Usage — {stamp}"]
+    lines = [colorize("🤖 AI Usage", "1;37", color), f"   Updated {stamp}", colorize("─" * 58, "90", color), colorize("At a glance", "1", color)]
     titles = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
+    for service, title in titles.items():
+        status, code = quota_summary(report["services"][service], service)
+        lines.append(f"  {title:<13} {colorize(status, code, color)}")
     for service, title in titles.items():
         data = report["services"][service]
         quota = data.get("quota")
         source = data.get("source", "unknown")
         if isinstance(quota, dict) and source == "not configured":
             source = data.get("quota_source", "provider quota")
-        lines.append(f"\n{title} · {source}")
+        lines.extend(["", colorize("─" * 58, "90", color), colorize(title.upper(), "1;36", color), f"  Source: {source}"])
         if isinstance(quota, dict):
-            lines.append(f"  Plan quota · {data.get('quota_source', 'provider')}")
-            lines.extend(render_quota(quota))
+            lines.append(f"  PLAN · {data.get('quota_source', 'provider')}")
+            lines.extend(render_quota(quota, color))
         elif data.get("quota_status"):
-            lines.append(f"  Plan quota: {data['quota_status']}")
+            lines.append(f"  PLAN · {colorize('Unavailable', '33', color)} — {data['quota_status']}")
         if data.get("error"):
             lines.append(f"  ⚠ {data['error']}")
             continue
         if service in ("claude", "codex") and data.get("source", "").startswith("ccusage"):
-            lines.append("  Activity · local logs; estimated cost, not plan usage")
+            lines.append("  ACTIVITY · local logs; separate from plan quota")
             if service == "claude":
                 block = activity_record(data.get("blocks"), ("blocks", "data"))
                 weekly = activity_record(data.get("weekly"), ("weekly", "data"))
                 for label, record in (("Recent 5h", block), ("Weekly", weekly)):
                     line = activity_line(label, record)
                     if line:
-                        lines.append(line)
+                        lines.append(f"    {line.strip()}")
             else:
                 daily = activity_record(data.get("daily"), ("daily", "data"))
                 line = activity_line("Latest daily", daily)
                 if line:
-                    lines.append(line)
+                    lines.append(f"    {line.strip()}")
             if data.get("captured_at"):
-                lines.append(f"  Captured: {data['captured_at']}")
+                lines.append(f"    Captured {data['captured_at']}")
             continue
         if data.get("status") and not quota:
             lines.append(f"  {data['status']}")
@@ -790,31 +833,39 @@ def render(report: dict[str, Any]) -> str:
                 used = plan.get("used")
                 limit = plan.get("limit")
                 remaining = plan.get("remaining")
+                lines.append("  INCLUDED USAGE")
                 if used is not None and limit is not None:
-                    lines.append(f"  Plan usage: {used} / {limit}")
-                if remaining is not None:
-                    lines.append(f"  Remaining: {remaining}")
-                for name, key in (("Auto / Cursor models", "autoPercentUsed"), ("API / other models", "apiPercentUsed"), ("Total", "totalPercentUsed")):
+                    lines.append(f"    Used {used} / {limit}" + (f" · {remaining} remaining" if remaining is not None else ""))
+                total_percent = plan.get("totalPercentUsed")
+                if isinstance(total_percent, (int, float)):
+                    remaining_percent = max(0, min(100, 100 - total_percent))
+                    code = remaining_color(remaining_percent)
+                    remaining_label = colorize(f"{remaining_percent:.1f}% left", code, color)
+                    lines.append(f"    {colorize(progress_bar(remaining_percent), code, color)}  {remaining_label}")
+                lines.append("  MODEL POOLS")
+                for name, key in (("Auto", "autoPercentUsed"), ("API / other", "apiPercentUsed")):
                     percent = plan.get(key)
                     if isinstance(percent, (int, float)):
-                        lines.append(f"  {name}: {100 - percent:.1f}% remaining")
-                        if key == "totalPercentUsed":
-                            remaining_percent = max(0, min(100, 100 - percent))
-                            lines.append(f"  Included   {progress_bar(remaining_percent)}  {remaining_percent:.1f}% remaining")
+                        pool_remaining = max(0, min(100, 100 - percent))
+                        code = remaining_color(pool_remaining)
+                        pool_label = colorize(f"{pool_remaining:.1f}% left", code, color)
+                        lines.append(f"    {name:<12} {colorize(progress_bar(pool_remaining), code, color)}  {pool_label}")
                 cycle_start = parsed_time(usage.get("billingCycleStart"))
                 cycle_end = parsed_time(usage.get("billingCycleEnd"))
                 if cycle_start and cycle_end:
                     cycle_seconds = (cycle_end - cycle_start).total_seconds()
                     pace = pace_assessment(plan.get("totalPercentUsed"), usage.get("billingCycleEnd"), cycle_seconds)
                     if pace:
-                        lines.append(f"  {pace}")
-            if usage.get("billingCycleStart") or usage.get("billingCycleEnd"):
-                lines.append(f"  Billing cycle: {usage.get('billingCycleStart', '?')} → {usage.get('billingCycleEnd', '?')}")
+                        lines.append(f"    {colorize(pace, '31' if pace.startswith('⚠') else '32', color)}")
+                    local_start = cycle_start.astimezone()
+                    local_end = cycle_end.astimezone()
+                    until_reset = duration((cycle_end - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                    lines.append(f"    Cycle {local_start:%b} {local_start.day} → {local_end:%b} {local_end.day} · resets in {until_reset}")
             on_demand = usage.get("individualUsage", {}).get("onDemand", {})
             if on_demand.get("enabled"):
-                lines.append(f"  On-demand used: {on_demand.get('used', 'unknown')} (dashboard units)")
+                lines.append(f"  ON-DEMAND · {on_demand.get('used', 'unknown')} dashboard units used")
             if data.get("captured_at"):
-                lines.append(f"  Captured: {data['captured_at']}")
+                lines.append(f"    Captured {data['captured_at']}")
             continue
         if service in ("claude", "codex") and "weekly" in data:
             if "blocks" in data:
@@ -915,11 +966,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        message = render(report)
+        use_color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+        message = render(report, color=use_color)
         print(message)
         if args.slack:
             try:
-                post_slack(message, config)
+                post_slack(render(report), config)
                 print("\nSent to Slack")
             except RuntimeError as e:
                 print(f"\nai-usage: {e}", file=sys.stderr)

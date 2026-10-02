@@ -70,6 +70,8 @@ ai-usage install-agent   # load the scheduled job
 ai-usage uninstall-agent # unload it
 ```
 
+Interactive terminals show color-coded quota bars and a provider summary. Slack and redirected output stay plain text. Set `NO_COLOR=1` to turn off terminal colors.
+
 The schedule is 09:00, 13:00, and 17:00 local time. `install-agent` generates and loads the plist, reading `~/.config/ai-usage/environment` for the webhook environment variable.
 
 ### Manual snapshots
