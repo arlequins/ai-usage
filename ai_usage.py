@@ -85,8 +85,11 @@ def setting(name: str) -> str:
 
 def claude_data() -> dict[str, Any]:
     try:
-        blocks = command_json(["ccusage", "claude", "blocks", "--json"])
-        weekly = command_json(["ccusage", "claude", "weekly", "--json"])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            blocks_future = pool.submit(command_json, ["ccusage", "claude", "blocks", "--json"])
+            weekly_future = pool.submit(command_json, ["ccusage", "claude", "weekly", "--json"])
+            blocks = blocks_future.result()
+            weekly = weekly_future.result()
         return {
             "source": "ccusage local logs (activity, not plan quota)",
             "captured_at": now().isoformat(timespec="minutes"),
