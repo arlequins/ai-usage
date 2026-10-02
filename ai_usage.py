@@ -110,9 +110,14 @@ def claude_data() -> dict[str, Any]:
 
 def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
     """Read existing Claude Code credentials from its config file or macOS Keychain."""
+    environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if environment_token:
+        return {"accessToken": environment_token}, None
+
     credentials_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
     credentials_path = credentials_dir / ".credentials.json"
     expired_credentials: dict[str, Any] | None = None
+    keychain_item_without_oauth = False
 
     def select_oauth(value: Any) -> dict[str, Any] | None:
         nonlocal expired_credentials
@@ -154,11 +159,18 @@ def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
                 oauth = select_oauth(stored)
                 if oauth:
                     return oauth, None
+                if isinstance(stored, dict) and not isinstance(stored.get("claudeAiOauth"), dict):
+                    keychain_item_without_oauth = True
+                elif isinstance(stored, dict) and not (stored["claudeAiOauth"].get("accessToken")):
+                    keychain_item_without_oauth = True
             elif "User interaction is not allowed" in proc.stderr or "authentication" in proc.stderr.lower():
                 keychain_unavailable = True
 
     if expired_credentials:
         return expired_credentials, None
+
+    if keychain_item_without_oauth:
+        return None, "Claude Code Keychain item exists, but it has no Claude account OAuth token. Check /status in Claude Code; if signed in, update Claude Code and run /login again."
 
     if sys.platform == "darwin" and keychain_unavailable:
         return None, "Claude Code credentials could not be read from macOS Keychain. Open Claude Code and unlock your login keychain."
