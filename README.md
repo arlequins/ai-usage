@@ -43,14 +43,33 @@ Requires macOS and Python 3.11+ (no third-party Python packages).
 
 The installer creates `~/.local/bin/ai-usage` and the user configuration and snapshot directories. Add `~/.local/bin` to `PATH` if needed.
 
-Add a Slack Incoming Webhook URL to `~/.config/ai-usage/config.toml`:
+### Slack bot delivery
+
+Create a Slack app, add the `chat:write` bot token scope, install it in your workspace, and invite the bot to the destination channel. Copy the Bot User OAuth Token (`xoxb-…`) and the channel ID. Slack may require a workspace admin to approve app installation. The bot posts using `chat.postMessage`; the bot must be a member of the channel. See Slack's [`chat.postMessage` documentation](https://api.slack.com/methods/chat.postMessage).
+
+Enter the token and channel ID without putting the token in shell history:
+
+```zsh
+mkdir -p ~/.config/ai-usage
+read -r -s "AI_USAGE_SLACK_BOT_TOKEN?Slack Bot User OAuth Token: "
+printf '\n'
+read -r "AI_USAGE_SLACK_CHANNEL?Slack channel ID: "
+printf '\nAI_USAGE_SLACK_BOT_TOKEN=%s\nAI_USAGE_SLACK_CHANNEL=%s\n' "$AI_USAGE_SLACK_BOT_TOKEN" "$AI_USAGE_SLACK_CHANNEL" >> ~/.config/ai-usage/environment
+chmod 600 ~/.config/ai-usage/environment
+unset AI_USAGE_SLACK_BOT_TOKEN AI_USAGE_SLACK_CHANNEL
+ai-usage --slack
+```
+
+The environment file can also be used by the scheduled `launchd` job. Bot credentials take precedence when both bot and webhook credentials are configured.
+
+Incoming Webhooks are also supported as an alternative. Add a Slack Incoming Webhook URL to `~/.config/ai-usage/config.toml`:
 
 ```toml
 [slack]
 webhook_url_env = "AI_USAGE_SLACK_WEBHOOK_URL"
 ```
 
-Store the webhook in your shell environment or a launchd-readable environment file. For scheduled delivery, use the launchd environment file:
+Store the webhook in the launchd-readable environment file:
 
 ```sh
 mkdir -p ~/.config/ai-usage
@@ -72,7 +91,7 @@ ai-usage uninstall-agent # unload it
 
 Interactive terminals show color-coded quota bars and a provider summary. Slack and redirected output stay plain text. Set `NO_COLOR=1` to turn off terminal colors.
 
-The schedule is 09:00, 13:00, and 17:00 local time. `install-agent` generates and loads the plist, reading `~/.config/ai-usage/environment` for the webhook environment variable.
+The schedule is 09:00, 13:00, and 17:00 local time. `install-agent` generates and loads the plist, reading `~/.config/ai-usage/environment` for the Slack credentials.
 
 ### Manual snapshots
 

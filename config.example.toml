@@ -1,4 +1,6 @@
 [slack]
+bot_token_env = "AI_USAGE_SLACK_BOT_TOKEN"
+channel_env = "AI_USAGE_SLACK_CHANNEL"
 webhook_url_env = "AI_USAGE_SLACK_WEBHOOK_URL"
 
 # Optional adapters that override built-in Claude and Codex collectors.

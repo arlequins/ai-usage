@@ -1094,17 +1094,46 @@ def render(report: dict[str, Any], color: bool = False) -> str:
 
 def post_slack(message: str, config: dict[str, Any]) -> None:
     slack = config.get("slack", {})
-    env_name = slack.get("webhook_url_env", "AI_USAGE_SLACK_WEBHOOK_URL")
-    url = os.environ.get(env_name, "")
-    if not url:
+    def configured_value(env_name: str) -> str:
+        value = os.environ.get(env_name, "")
+        if value:
+            return value
         env_file = APP_DIR / "environment"
         if env_file.exists():
             for line in env_file.read_text().splitlines():
                 if line.startswith(env_name + "="):
-                    url = line.split("=", 1)[1].strip().strip("\"'")
-                    break
+                    return line.split("=", 1)[1].strip().strip("\"'")
+        return ""
+
+    token_env = slack.get("bot_token_env", "AI_USAGE_SLACK_BOT_TOKEN")
+    channel_env = slack.get("channel_env", "AI_USAGE_SLACK_CHANNEL")
+    token = configured_value(token_env)
+    channel = configured_value(channel_env)
+    if token:
+        if not channel:
+            raise RuntimeError(f"Set {channel_env} to the Slack channel ID for the bot")
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=json.dumps({"channel": channel, "text": message}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                result = json.loads(response.read().decode())
+            if not result.get("ok"):
+                raise RuntimeError(f"Slack bot delivery failed: {result.get('error', 'unknown error')}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Slack delivery failed: {e}") from e
+        return
+
+    env_name = slack.get("webhook_url_env", "AI_USAGE_SLACK_WEBHOOK_URL")
+    url = configured_value(env_name)
     if not url.startswith("https://hooks.slack.com/services/"):
-        raise RuntimeError(f"Set {env_name} to a Slack Incoming Webhook URL")
+        raise RuntimeError(f"Set {token_env} and {channel_env} for bot delivery, or {env_name} for an Incoming Webhook")
     req = urllib.request.Request(url, data=json.dumps({"text": message}).encode(), headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
