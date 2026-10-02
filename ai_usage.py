@@ -134,29 +134,33 @@ def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
 
     if sys.platform == "darwin":
         security = shutil.which("security") or "/usr/bin/security"
-        try:
-            proc = subprocess.run(
-                [security, "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            proc = None
-        if proc is not None and proc.returncode == 0:
+        username = os.environ.get("USER") or credentials_dir.parent.name
+        queries = (
+            [security, "find-generic-password", "-a", username, "-s", "Claude Code-credentials", "-w"],
+            [security, "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        )
+        keychain_unavailable = False
+        for argv in queries:
             try:
-                stored = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                stored = None
-            oauth = select_oauth(stored)
-            if oauth:
-                return oauth, None
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                keychain_unavailable = True
+                continue
+            if proc.returncode == 0:
+                try:
+                    stored = json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    stored = None
+                oauth = select_oauth(stored)
+                if oauth:
+                    return oauth, None
+            elif "User interaction is not allowed" in proc.stderr or "authentication" in proc.stderr.lower():
+                keychain_unavailable = True
 
     if expired_credentials:
         return expired_credentials, None
 
-    if sys.platform == "darwin" and proc is None:
+    if sys.platform == "darwin" and keychain_unavailable:
         return None, "Claude Code credentials could not be read from macOS Keychain. Open Claude Code and unlock your login keychain."
 
     return None, "Claude Code OAuth credentials were not found in the local file or macOS Keychain. Open Claude Code and sign in first."
