@@ -1,6 +1,6 @@
 # ai-usage
 
-macOS command-line usage digest for Claude Desktop/Code, Codex, and Cursor. It prints a terminal report and can post the same report to Slack Incoming Webhooks.
+macOS command-line usage digest for Claude Desktop/Code, Codex, and Cursor. It prints a detailed terminal report and can send a compact, configurable summary to Slack through a bot or Incoming Webhook.
 
 ## What can be collected
 
@@ -10,7 +10,7 @@ macOS command-line usage digest for Claude Desktop/Code, Codex, and Cursor. It p
 | Codex | `ccusage codex daily --json` and Codex CLI `app-server` | Shows local activity plus account rate-limit windows and reset times from the signed-in Codex CLI session. |
 | Cursor | Cursor.app local session plus dashboard `GET /api/usage-summary` | Reads the existing Cursor login token from the local app database, then reports IDE plan usage pools and billing cycle. The endpoint and token format are undocumented and may change. |
 
-The terminal and Slack use the same compact report. Provider quota/reset information is shown separately from `ccusage` local activity; estimated token costs are not plan balances or invoices. For quota windows with known duration, `ai-usage` estimates whether the current average consumption rate could exhaust the limit before reset. This is a projection from one usage snapshot and assumes a steady rate; it is not a guarantee. When a local activity total is unusually large, the report flags it for review instead of presenting it as quota consumption.
+The terminal report separates provider quota/reset information from `ccusage` local activity; estimated token costs are not plan balances or invoices. The Slack summary only includes Claude weekly usage and Cursor usage, with their next reset times; Codex is omitted. For quotas with enough timing data, the summary estimates whether usage will run out before reset. This projection assumes a steady rate and is not a guarantee. When a local activity total is unusually large, the terminal report flags it for review instead of presenting it as quota consumption.
 
 Claude quota is read from the same undocumented OAuth usage endpoint used by Claude's usage view. `ai-usage` prefers `CLAUDE_CODE_OAUTH_TOKEN` when set, then the Claude Code credentials file or Keychain item. If those do not contain a usable OAuth token, macOS Claude Desktop is checked: its encrypted `oauth:tokenCacheV2` or `oauth:tokenCache` value is decrypted in memory using the `Claude Safe Storage` Keychain key. The active desktop cache is read-only; `ai-usage` does not refresh tokens or write to Claude's config. Tokens are never printed or stored by `ai-usage`. If a token is expired, reopen Claude Desktop or Claude Code to refresh sign-in. Keychain access may require the login keychain to be unlocked. These token formats and the usage endpoint are undocumented and may change.
 
@@ -33,15 +33,68 @@ CURSOR_SESSION_TOKEN=your_workos_cursor_session_token
 
 Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. This value is a sensitive login session credential: do not share it or commit it. It can expire; if Cursor returns 401, reopen Cursor or sign in to the dashboard to refresh the session. Cursor may change the private app database key, session format, or endpoint at any time.
 
-## Install
+## Installation
 
-Requires macOS and Python 3.11+ (no third-party Python packages).
+Requirements:
 
-```sh
+- macOS
+- Python 3.11 or newer
+- `ccusage` is optional and provides local activity/cost reports. Provider quota collection does not depend on it.
+
+### Install the packaged CLI
+
+The GitHub release includes a Python wheel and source archive. `pipx` installs the command into an isolated environment and adds the executable to your user path. Install `pipx` if needed, then install the release wheel:
+
+```zsh
+brew install pipx
+pipx ensurepath
+```
+
+Restart Terminal after `pipx ensurepath`, then run:
+
+```zsh
+pipx install https://github.com/arlequins/ai-usage/releases/download/v0.1.0/ai_usage-0.1.0-py3-none-any.whl
+ai-usage --version
+ai-usage
+```
+
+To upgrade to a newer release, replace the version in the wheel URL and run `pipx install --force "https://github.com/arlequins/ai-usage/releases/download/v0.1.1/ai_usage-0.1.1-py3-none-any.whl"` (substitute the current release version).
+
+### Install from a checkout
+
+The repository installer remains available and copies the standalone script to `~/.local/bin`:
+
+```zsh
+git clone https://github.com/arlequins/ai-usage.git
+cd ai-usage
 ./install.sh
 ```
 
-The installer creates `~/.local/bin/ai-usage` and the user configuration and snapshot directories. Add `~/.local/bin` to `PATH` if needed.
+The installer creates `~/.local/bin/ai-usage`, `~/.config/ai-usage/config.toml`, and the snapshots directory. Add `~/.local/bin` to `PATH` if needed. For an existing checkout, update it with `git pull` before running `./install.sh` again.
+
+### Optional: install `ccusage`
+
+`ccusage` is needed only for Claude Code and Codex local activity/cost sections. Install it with npm, then verify that the command is available:
+
+```zsh
+npm install -g ccusage
+ccusage --version
+```
+
+### Sign in to provider apps
+
+- **Claude:** Sign in to Claude Desktop or Claude Code. macOS may ask to allow access to the `Claude Safe Storage` Keychain item. Quota uses an undocumented Anthropic endpoint; activity logs are separate.
+- **Codex:** Sign in to Codex CLI or the Codex app. The plan quota collector uses the local Codex app-server; local cost/activity reporting additionally uses `ccusage`.
+- **Cursor:** Open Cursor and sign in. The collector reads Cursor's existing local app session. A User API key is not used for IDE plan usage.
+
+Create the app configuration directory if you installed with `pipx` and plan to use local snapshots, Slack options, or provider command overrides:
+
+```zsh
+mkdir -p ~/.config/ai-usage/snapshots
+vi ~/.config/ai-usage/config.toml
+```
+
+The CLI works with built-in defaults if no config file exists.
 
 ### Slack bot delivery
 
@@ -69,7 +122,7 @@ Slack messages contain a compact summary of Claude's weekly usage and Cursor's u
 language = "ja" # Use "en" for English
 ```
 
-The message includes `@Wonho An` by default. To notify the user with a real Slack mention, save the member ID in `~/.config/ai-usage/environment` as `AI_USAGE_SLACK_MENTION_USER_ID=U...`. In Slack, open the user's profile, select **More**, then **Copy member ID**. The ID overrides the display name and is kept out of the repository.
+The message includes `@Wonho An` by default. To notify the user with a real Slack mention, save the member ID in `~/.config/ai-usage/environment` as `AI_USAGE_SLACK_MENTION_USER_ID=U...`. In Slack, open the user's profile, select **More**, then **Copy member ID**. The ID overrides the display name and is kept out of the repository. Keep this setting in the same private environment file as your bot token.
 
 Incoming Webhooks are also supported as an alternative. Add a Slack Incoming Webhook URL to `~/.config/ai-usage/config.toml`:
 
@@ -82,7 +135,7 @@ Store the webhook in the launchd-readable environment file:
 
 ```sh
 mkdir -p ~/.config/ai-usage
-printf '%s\n' 'AI_USAGE_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...' > ~/.config/ai-usage/environment
+printf '%s\n' 'AI_USAGE_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...' >> ~/.config/ai-usage/environment
 chmod 600 ~/.config/ai-usage/environment
 ```
 
@@ -92,7 +145,7 @@ Do not commit the webhook URL.
 
 ```sh
 ai-usage                 # terminal digest
-ai-usage --slack         # post digest to Slack
+ai-usage --slack         # post compact summary to Slack
 ai-usage --json          # machine-readable report
 ai-usage install-agent   # load the scheduled job
 ai-usage uninstall-agent # unload it
@@ -121,7 +174,7 @@ Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with th
 - Codex quota collection uses the Codex CLI app-server read-only request and its existing sign-in.
 - Cursor usage collection reads the local Cursor app session database in read-only mode and calls an undocumented dashboard endpoint. Its session token is sensitive and remains in memory only.
 - No Cursor User API key is used; those keys currently serve Cloud Agent API access rather than IDE plan usage.
-- Slack delivery sends the rendered digest to the configured Incoming Webhook.
+- Slack delivery sends the compact summary through the configured bot token/channel or Incoming Webhook.
 - Provider commands run as the current user. Configure only commands you trust.
 - `launchd` logs are written to `~/Library/Logs/ai-usage/`.
 

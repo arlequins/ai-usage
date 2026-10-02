@@ -31,6 +31,7 @@ APP_DIR = Path.home() / ".config" / "ai-usage"
 CONFIG = APP_DIR / "config.toml"
 SNAPSHOTS = APP_DIR / "snapshots"
 LABEL = "com.local.ai-usage"
+__version__ = "0.1.0"
 
 
 def now() -> dt.datetime:
@@ -1245,7 +1246,12 @@ def post_slack(message: str, config: dict[str, Any]) -> None:
 
 def create_agent() -> Path:
     home = Path.home()
-    bin_path = home / ".local" / "bin" / "ai-usage"
+    installed_cli = shutil.which("ai-usage")
+    program_arguments = (
+        [str(Path(installed_cli).resolve()), "--slack"]
+        if installed_cli
+        else [sys.executable, str(Path(__file__).resolve()), "--slack"]
+    )
     logs = home / "Library" / "Logs" / "ai-usage"
     logs.mkdir(parents=True, exist_ok=True)
     plist_path = home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -1259,7 +1265,7 @@ def create_agent() -> Path:
                 env[key.strip()] = val.strip().strip("\"'")
     payload = {
         "Label": LABEL,
-        "ProgramArguments": [str(bin_path), "--slack"],
+        "ProgramArguments": program_arguments,
         "StartCalendarInterval": [{"Hour": h, "Minute": 0} for h in (9, 13, 17)],
         "EnvironmentVariables": env,
         "StandardOutPath": str(logs / "stdout.log"),
@@ -1272,6 +1278,7 @@ def create_agent() -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai-usage", description="Local AI service usage digest")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--slack", action="store_true", help="send the report to Slack")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
     parser.add_argument("command", nargs="?", choices=("install-agent", "uninstall-agent", "snapshot"))
