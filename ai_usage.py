@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
@@ -68,6 +69,19 @@ def snapshot(label: str) -> dict[str, Any] | None:
         return {"source": "snapshot error", "error": str(e)}
 
 
+def setting(name: str) -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    env_file = APP_DIR / "environment"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            key, sep, raw = line.partition("=")
+            if sep and key.strip() == name:
+                return raw.strip().strip("\"'")
+    return ""
+
+
 def claude_data() -> dict[str, Any]:
     try:
         blocks = command_json(["ccusage", "claude", "blocks", "--json"])
@@ -98,6 +112,45 @@ def codex_data() -> dict[str, Any]:
         return {"source": "unavailable", "error": str(e)}
 
 
+def cursor_data() -> dict[str, Any]:
+    api_key = setting("CURSOR_ADMIN_API_KEY")
+    email = setting("CURSOR_USER_EMAIL")
+    if not api_key:
+        return {"source": "not configured", "status": "Set CURSOR_ADMIN_API_KEY to enable Cursor Team API."}
+    if not email:
+        return {"source": "not configured", "status": "Set CURSOR_USER_EMAIL to filter your own team usage."}
+    body = json.dumps({"searchTerm": email, "page": 1, "pageSize": 100}).encode()
+    auth = base64.b64encode(f"{api_key}:".encode()).decode()
+    req = urllib.request.Request(
+        "https://api.cursor.com/teams/spend",
+        data=body,
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        return {"source": "Cursor Team Admin API", "error": f"Cursor API request failed: {e}"}
+    people = result.get("teamMemberSpend", [])
+    match = next((person for person in people if person.get("email", "").casefold() == email.casefold()), None)
+    if match is None:
+        return {"source": "Cursor Team Admin API", "error": f"No team member matched CURSOR_USER_EMAIL ({email}). Check the email and API key read scope."}
+    return {
+        "source": "Cursor Team Admin API · current billing cycle",
+        "captured_at": now().isoformat(timespec="minutes"),
+        "usage": {
+            "email": match.get("email"),
+            "on_demand_spend_cents": match.get("spendCents"),
+            "overall_spend_cents": match.get("overallSpendCents"),
+            "effective_limit_dollars": match.get("effectivePerUserLimitDollars"),
+            "monthly_limit_dollars": match.get("monthlyLimitDollars"),
+            "fast_premium_requests": match.get("fastPremiumRequests"),
+            "cycle_start": result.get("subscriptionCycleStart"),
+        },
+    }
+
+
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"generated_at": now().isoformat(timespec="minutes"), "services": {}}
     for service in ("claude", "codex", "cursor"):
@@ -105,11 +158,16 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
             configured = run_configured(service, config)
         except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
             configured = {"source": "configured command failed", "error": str(e)}
-        data = configured or snapshot(service)
+        if service == "cursor" and not configured and setting("CURSOR_ADMIN_API_KEY"):
+            data = cursor_data()
+        else:
+            data = configured or snapshot(service)
         if service == "claude" and data is None:
             data = claude_data()
         if service == "codex" and data is None:
             data = codex_data()
+        if service == "cursor" and data is None:
+            data = cursor_data()
         if data is None:
             data = {"source": "not configured", "status": "No automatic source or snapshot is configured."}
         result["services"][service] = data
@@ -153,6 +211,22 @@ def render(report: dict[str, Any]) -> str:
             continue
         if data.get("status"):
             lines.append(f"  {data['status']}")
+            continue
+        if service == "cursor" and "usage" in data:
+            usage = data["usage"]
+            lines.append(f"  Account: {usage['email']}")
+            if usage.get("on_demand_spend_cents") is not None:
+                lines.append(f"  On-demand spend: ${usage['on_demand_spend_cents'] / 100:.2f}")
+            if usage.get("overall_spend_cents") is not None:
+                lines.append(f"  Overall spend: ${usage['overall_spend_cents'] / 100:.2f}")
+            if usage.get("effective_limit_dollars") is not None:
+                lines.append(f"  Effective spend limit: ${usage['effective_limit_dollars']:.2f}")
+            if usage.get("monthly_limit_dollars") is not None:
+                lines.append(f"  Monthly spend limit: ${usage['monthly_limit_dollars']:.2f}")
+            if usage.get("fast_premium_requests") is not None:
+                lines.append(f"  Fast premium requests: {usage['fast_premium_requests']}")
+            if data.get("captured_at"):
+                lines.append(f"  Captured: {data['captured_at']}")
             continue
         if service in ("claude", "codex") and "weekly" in data:
             if "blocks" in data:
