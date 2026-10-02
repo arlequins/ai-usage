@@ -908,7 +908,18 @@ def render_quota(row: dict[str, Any], color: bool = False) -> list[str]:
         reset = reset_label(window.get("resetAt"))
         if reset:
             lines.append(f"      ↻ Reset in {reset}")
-        pace = pace_assessment(used, window.get("resetAt"), window.get("windowDurationSeconds"))
+        exhausted = (
+            isinstance(remaining, (int, float)) and remaining <= 0
+        ) or (isinstance(used, (int, float)) and used >= 100)
+        if exhausted:
+            reset_at = parsed_time(window.get("resetAt"))
+            if reset_at:
+                until_reset = duration((reset_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                pace = f"⚠ Quota exhausted; resets in {until_reset}"
+            else:
+                pace = "⚠ Quota exhausted"
+        else:
+            pace = pace_assessment(used, window.get("resetAt"), window.get("windowDurationSeconds"))
         if pace:
             code = "31" if pace.startswith("⚠") else "32"
             lines.append(f"      {colorize(pace, code, color)}")
@@ -953,6 +964,22 @@ def quota_summary(data: dict[str, Any], service: str) -> tuple[str, str]:
         ]
         if remaining:
             lowest = min(remaining)
+            if lowest <= 0:
+                exhausted_window = next(
+                    (
+                        window for window in windows
+                        if isinstance(window, dict)
+                        and isinstance(window.get("remainingPercent"), (int, float))
+                        and window["remainingPercent"] <= 0
+                    ),
+                    None,
+                )
+                reset_at = parsed_time(exhausted_window.get("resetAt")) if exhausted_window else None
+                reset_suffix = (
+                    f" · reset in {duration((reset_at - dt.datetime.now(dt.timezone.utc)).total_seconds())}"
+                    if reset_at else ""
+                )
+                return f"⚠ exhausted{reset_suffix}", "31"
             state = "⚠ low" if lowest < 20 else "✓ available"
             return f"{state} · {lowest:.0f}% min left", "31" if lowest < 20 else "32"
     if service == "cursor":
