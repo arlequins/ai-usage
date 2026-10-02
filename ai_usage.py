@@ -196,10 +196,16 @@ def service_data(service: str, config: dict[str, Any]) -> dict[str, Any]:
 
 def has_quota_data(row: dict[str, Any]) -> bool:
     windows = row.get("windows")
+    has_window = isinstance(windows, list) and any(
+        isinstance(window, dict)
+        and not window.get("idle")
+        and any(window.get(key) is not None for key in ("usedPercent", "remainingPercent", "resetAt"))
+        for window in windows
+    )
     return bool(
-        (isinstance(windows, list) and any(isinstance(window, dict) and not window.get("idle") for window in windows))
-        or row.get("pace")
-        or row.get("credits")
+        has_window
+        or (isinstance(row.get("pace"), dict) and bool(row["pace"]))
+        or (isinstance(row.get("credits"), dict) and bool(row["credits"]))
     )
 
 
@@ -226,7 +232,11 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
         elif quota_snapshot is None:
             data["quota_status"] = "CodexBar CLI is not installed; plan limits and pace forecasts are unavailable."
         else:
-            data["quota_status"] = "No quota data returned. Enable and sign in to this provider in CodexBar."
+            data["quota_status"] = (
+                "Cursor IDE plan data was not returned. Enable Cursor and sign in through CodexBar."
+                if service == "cursor"
+                else "No plan quota data returned by CodexBar."
+            )
         result["services"][service] = data
     return result
 
@@ -254,6 +264,110 @@ def summarize(value: Any, depth: int = 0) -> list[str]:
             return ["(no records)"]
         return summarize(value[-1], depth + 1)
     return [str(value)]
+
+
+ACTIVITY_FIELDS = ("totalTokens", "inputTokens", "outputTokens", "totalCost", "totalCostUSD", "costUSD")
+
+
+def activity_record(value: Any, sections: tuple[str, ...]) -> dict[str, Any] | None:
+    """Select the newest report row from the supported ccusage JSON shapes."""
+    def newest(rows: list[Any]) -> dict[str, Any] | None:
+        records = [row for row in rows if isinstance(row, dict)]
+        if not records:
+            return None
+        date_fields = ("startTime", "blockStart", "firstActivity", "week", "date")
+        dated = [(next((str(row[key]) for key in date_fields if row.get(key)), ""), row) for row in records]
+        dated = [(stamp, row) for stamp, row in dated if stamp]
+        return max(dated, key=lambda item: item[0])[1] if dated else records[-1]
+
+    if isinstance(value, list):
+        return newest(value)
+    if not isinstance(value, dict):
+        return None
+    for section in sections:
+        child = value.get(section)
+        if isinstance(child, list):
+            row = newest(child)
+            if row:
+                return row
+        if isinstance(child, dict):
+            row = activity_record(child, sections)
+            if row:
+                return row
+    if any(field in value for field in ACTIVITY_FIELDS):
+        return value
+    for key in ("summary", "totals", "data"):
+        child = value.get(key)
+        if isinstance(child, dict):
+            row = activity_record(child, sections)
+            if row:
+                return row
+    return None
+
+
+def number(value: Any) -> str | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+
+
+def local_period(start: Any, end: Any) -> str | None:
+    def parse(value: Any) -> dt.datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.astimezone()
+        except ValueError:
+            return None
+
+    first, last = parse(start), parse(end)
+    if first and last:
+        return f"{first:%m-%d %H:%M}–{last:%H:%M}"
+    if first:
+        return first.strftime("%m-%d %H:%M")
+    return None
+
+
+def activity_line(label: str, record: dict[str, Any] | None) -> str | None:
+    if not record:
+        return None
+    metrics = dict(record)
+    nested = record.get("tokenCounts")
+    if isinstance(nested, dict):
+        metrics.update(nested)
+    start = record.get("startTime") or record.get("blockStart") or record.get("firstActivity")
+    end = record.get("endTime") or record.get("blockEnd") or record.get("lastActivity")
+    period = local_period(start, end) if start else None
+    if not period and record.get("week"):
+        period = f"week of {record['week']}"
+    elif not period and record.get("date"):
+        period = str(record["date"])
+    tokens = number(metrics.get("totalTokens"))
+    cost = next((metrics[key] for key in ("totalCostUSD", "totalCost", "costUSD") if isinstance(metrics.get(key), (int, float))), None)
+    details: list[str] = []
+    if period:
+        details.append(period)
+    if record.get("isActive") is True:
+        details.append("active")
+    elif record.get("isActive") is False:
+        details.append("ended")
+    if tokens:
+        details.append(f"{tokens} tokens")
+    if isinstance(cost, (int, float)):
+        details.append(f"~${cost:,.2f} estimated")
+    if not details:
+        return None
+    line = f"  {label}: " + " · ".join(details)
+    input_tokens = number(metrics.get("inputTokens"))
+    output_tokens = number(metrics.get("outputTokens"))
+    if input_tokens or output_tokens:
+        line += f" (in {input_tokens or '?'} / out {output_tokens or '?'})"
+    if tokens and tokens >= 1_000_000_000:
+        line += " ⚠ unusually large local-log total; verify ccusage output"
+    return line
 
 
 def progress_bar(remaining: float, width: int = 10) -> str:
@@ -352,9 +466,26 @@ def render(report: dict[str, Any]) -> str:
             lines.append("  Quota and pace · CodexBar")
             lines.extend(render_quota(quota))
         elif data.get("quota_status"):
-            lines.append(f"  Quota: {data['quota_status']}")
+            lines.append(f"  Plan quota: {data['quota_status']}")
         if data.get("error"):
             lines.append(f"  ⚠ {data['error']}")
+            continue
+        if service in ("claude", "codex") and data.get("source", "").startswith("ccusage"):
+            lines.append("  Activity · local logs; estimated cost, not plan usage")
+            if service == "claude":
+                block = activity_record(data.get("blocks"), ("blocks", "data"))
+                weekly = activity_record(data.get("weekly"), ("weekly", "data"))
+                for label, record in (("Recent 5h", block), ("Weekly", weekly)):
+                    line = activity_line(label, record)
+                    if line:
+                        lines.append(line)
+            else:
+                daily = activity_record(data.get("daily"), ("daily", "data"))
+                line = activity_line("Latest daily", daily)
+                if line:
+                    lines.append(line)
+            if data.get("captured_at"):
+                lines.append(f"  Captured: {data['captured_at']}")
             continue
         if data.get("status") and not quota:
             lines.append(f"  {data['status']}")

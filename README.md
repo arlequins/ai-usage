@@ -12,6 +12,8 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 
 When [CodexBar](https://github.com/steipete/CodexBar) is installed, `ai-usage` also reads its quota snapshot for all three providers. This adds remaining percentages, reset countdowns, and pace-based depletion forecasts while keeping the local Claude/Codex activity totals. CodexBar reuses existing sign-ins and can obtain Cursor usage from Cursor.app or browser sessions, so a manually copied Cursor session token is not required.
 
+The terminal and Slack use the same compact report. Provider quota/reset information is shown separately from `ccusage` local activity; estimated token costs are not plan balances or invoices. When a local activity total is unusually large, the report flags it for review instead of presenting it as quota consumption.
+
 Install CodexBar with `brew install --cask codexbar`, open it once, and enable Claude, Codex, and Cursor under Settings → Providers. Its CLI data source is read-only; `ai-usage` does not read or store provider credentials when using this path. The pace forecast compares current quota use with the elapsed reset window; it is an estimate, not a guarantee of future usage.
 
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:
