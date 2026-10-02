@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import ctypes
+import ctypes.util
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import hashlib
 import json
 import os
 import plistlib
@@ -109,7 +113,7 @@ def claude_data() -> dict[str, Any]:
 
 
 def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
-    """Read existing Claude Code credentials from its config file or macOS Keychain."""
+    """Read existing Claude OAuth credentials from environment, local stores, or Desktop."""
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if environment_token:
         return {"accessToken": environment_token}, None
@@ -166,29 +170,144 @@ def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
             elif "User interaction is not allowed" in proc.stderr or "authentication" in proc.stderr.lower():
                 keychain_unavailable = True
 
+    desktop_oauth, desktop_error = claude_desktop_oauth_credentials()
+    if desktop_oauth:
+        return desktop_oauth, None
+    if desktop_error:
+        return None, desktop_error
+
     if expired_credentials:
         return expired_credentials, None
 
     if keychain_item_without_oauth:
-        return None, "Claude Code Keychain item exists, but it has no Claude account OAuth token. Check /status in Claude Code; if signed in, update Claude Code and run /login again."
+        return None, "Claude Code Keychain item exists, but it has no Claude account OAuth token."
 
     if sys.platform == "darwin" and keychain_unavailable:
-        return None, "Claude Code credentials could not be read from macOS Keychain. Open Claude Code and unlock your login keychain."
+        return None, "Claude Code credentials could not be read from macOS Keychain. Unlock your login keychain."
 
-    return None, "Claude Code OAuth credentials were not found in the local file or macOS Keychain. Open Claude Code and sign in first."
+    return None, "Claude OAuth credentials were not found in the local file or macOS Keychain."
+
+
+def claude_desktop_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
+    """Read the active Claude Desktop OAuth token without modifying its app data."""
+    if sys.platform != "darwin":
+        return None, None
+
+    config_path = Path.home() / "Library" / "Application Support" / "Claude" / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(config, dict):
+        return None, "Claude Desktop config is not a JSON object."
+
+    encrypted_cache = next(
+        (config.get(key) for key in ("oauth:tokenCacheV2", "oauth:tokenCache") if isinstance(config.get(key), str)),
+        None,
+    )
+    if not encrypted_cache:
+        return None, None
+
+    security = shutil.which("security") or "/usr/bin/security"
+    keychain_secret = ""
+    keychain_denied = False
+    for argv in (
+        [security, "find-generic-password", "-a", "Claude", "-s", "Claude Safe Storage", "-w"],
+        [security, "find-generic-password", "-s", "Claude Safe Storage", "-w"],
+    ):
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            keychain_denied = True
+            break
+        if proc.returncode == 0 and proc.stdout.strip():
+            keychain_secret = proc.stdout.strip()
+            break
+        if "User interaction is not allowed" in proc.stderr or "authentication" in proc.stderr.lower():
+            keychain_denied = True
+            break
+    if not keychain_secret:
+        if keychain_denied:
+            return None, "Claude Desktop token cache exists, but macOS denied access to its Safe Storage Keychain key. Allow Terminal to read it and retry."
+        return None, "Claude Desktop token cache exists, but its 'Claude Safe Storage' Keychain key was not found."
+
+    try:
+        key = hashlib.pbkdf2_hmac("sha1", keychain_secret.encode(), b"saltysalt", 1003, dklen=16)
+        decoded = base64.b64decode(encrypted_cache, validate=True)
+        if not decoded.startswith(b"v10") or len(decoded) <= 3 or (len(decoded) - 3) % 16:
+            return None, "Claude Desktop token cache uses an unsupported encryption format."
+        plaintext = claude_desktop_decrypt(key, decoded[3:])
+        cache = json.loads(plaintext)
+    except (ValueError, binascii.Error, json.JSONDecodeError, OSError, RuntimeError) as e:
+        return None, f"Claude Desktop token cache could not be decrypted: {e}"
+
+    if isinstance(cache, dict):
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for cache_key, entry in cache.items():
+            if not isinstance(cache_key, str) or "user:inference" not in cache_key or not isinstance(entry, dict):
+                continue
+            access_token = entry.get("token")
+            if not isinstance(access_token, str) or not access_token:
+                continue
+            expires_at = entry.get("expiresAt")
+            if isinstance(expires_at, str) and expires_at.isdigit():
+                expires_at = int(expires_at)
+            if isinstance(expires_at, (int, float)) and expires_at <= dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + 60_000:
+                continue
+            candidates.append((int(expires_at) if isinstance(expires_at, (int, float)) else 0, {
+                "accessToken": access_token,
+                "expiresAt": expires_at,
+                "subscriptionType": entry.get("subscriptionType"),
+                "rateLimitTier": entry.get("rateLimitTier"),
+            }))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1], None
+
+    return None, "Claude Desktop token cache has no unexpired OAuth token with the usage scope. Open Claude Desktop and sign in again."
+
+
+def claude_desktop_decrypt(key: bytes, ciphertext: bytes) -> bytes:
+    """Decrypt Electron safeStorage AES-128-CBC using macOS CommonCrypto."""
+    library_path = ctypes.util.find_library("commonCrypto") or "/usr/lib/system/libcommonCrypto.dylib"
+    try:
+        common_crypto = ctypes.CDLL(library_path)
+    except OSError as e:
+        raise RuntimeError("macOS CommonCrypto is unavailable") from e
+
+    crypt = common_crypto.CCCrypt
+    crypt.argtypes = [
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    crypt.restype = ctypes.c_int32
+    key_buffer = ctypes.create_string_buffer(key)
+    iv_buffer = ctypes.create_string_buffer(b" " * 16)
+    input_buffer = ctypes.create_string_buffer(ciphertext)
+    output_buffer = ctypes.create_string_buffer(len(ciphertext) + 16)
+    output_length = ctypes.c_size_t()
+    status = crypt(
+        1, 0, 1, key_buffer, len(key), iv_buffer,
+        input_buffer, len(ciphertext), output_buffer, len(output_buffer),
+        ctypes.byref(output_length),
+    )
+    if status != 0:
+        raise RuntimeError("macOS CommonCrypto rejected the token cache")
+    return output_buffer.raw[:output_length.value]
 
 
 def claude_quota_data() -> dict[str, Any]:
-    """Read Claude Code plan limits using its current OAuth token, without refreshing it."""
+    """Read Claude plan limits using its current OAuth token, without refreshing it."""
     oauth, credential_error = claude_oauth_credentials()
     if oauth is None:
-        return {"error": credential_error or "Claude Code OAuth credentials were not found. Open Claude Code and sign in first."}
+        return {"error": credential_error or "Claude OAuth credentials were not found."}
     access_token = oauth.get("accessToken")
     expires_at = oauth.get("expiresAt")
     if not isinstance(access_token, str) or not access_token:
-        return {"error": "Claude Code OAuth token was not found in its local credentials."}
+        return {"error": "Claude OAuth token was not found in its credentials."}
     if isinstance(expires_at, (int, float)) and expires_at <= dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + 60_000:
-        return {"error": "Claude Code OAuth token is expired or nearly expired. Open Claude Code to refresh sign-in."}
+        return {"error": "Claude OAuth token is expired or nearly expired. Open Claude Desktop or Claude Code to refresh sign-in."}
 
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
@@ -199,7 +318,7 @@ def claude_quota_data() -> dict[str, Any]:
             usage = json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return {"error": "Anthropic rejected the Claude Code session. Open Claude Code to refresh sign-in."}
+            return {"error": "Anthropic rejected the Claude session. Reopen Claude Desktop or Claude Code and sign in again."}
         if e.code == 429:
             return {"error": "Anthropic temporarily rate-limited the usage request. Try again later."}
         return {"error": f"Claude usage request failed: HTTP {e.code} {e.reason}"}
@@ -248,7 +367,7 @@ def claude_quota_data() -> dict[str, Any]:
     plan = oauth.get("subscriptionType") or oauth.get("rateLimitTier")
     if plan:
         quota["identity"] = {"plan": plan}
-    return {"quota": quota, "source": "Claude Code usage endpoint (unofficial)"}
+    return {"quota": quota, "source": "Claude OAuth usage endpoint (unofficial)"}
 
 
 def quota_window(label: str, used: Any, reset_at: Any, duration_seconds: int) -> dict[str, Any] | None:
@@ -853,7 +972,7 @@ def quota_summary(data: dict[str, Any], service: str) -> tuple[str, str]:
 def render(report: dict[str, Any], color: bool = False) -> str:
     stamp = dt.datetime.fromisoformat(report["generated_at"]).strftime("%Y-%m-%d %H:%M %Z")
     lines = [colorize("🤖 AI Usage", "1;37", color), f"   Updated {stamp}", colorize("─" * 58, "90", color), colorize("At a glance", "1", color)]
-    titles = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
+    titles = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor"}
     for service, title in titles.items():
         status, code = quota_summary(report["services"][service], service)
         lines.append(f"  {title:<13} {colorize(status, code, color)}")
