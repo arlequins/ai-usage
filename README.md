@@ -12,7 +12,7 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 
 The terminal and Slack use the same compact report. Provider quota/reset information is shown separately from `ccusage` local activity; estimated token costs are not plan balances or invoices. Claude Code currently reports local activity only. When a local activity total is unusually large, the report flags it for review instead of presenting it as quota consumption.
 
-Codex quota is requested from the locally installed Codex CLI using its `app-server` protocol with read-only sandbox and no approval prompts. `ai-usage` does not read or refresh Codex credentials itself. The Codex CLI must be installed and signed in for quota windows to appear. The quota request runs alongside activity collection and has a 15-second timeout.
+Codex quota is requested from the locally installed Codex CLI, or the CLI bundled with the ChatGPT macOS app, using its `app-server` protocol with read-only sandbox and no approval prompts. `ai-usage` does not read or refresh Codex credentials itself. Codex must be installed and signed in for quota windows to appear. The quota request runs alongside activity collection and has a 15-second timeout.
 
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:
 

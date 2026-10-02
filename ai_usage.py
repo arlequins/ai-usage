@@ -207,6 +207,7 @@ def cursor_data() -> dict[str, Any]:
 def codex_executable() -> str | None:
     candidates = [
         shutil.which("codex"),
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
         str(Path.home() / ".local" / "bin" / "codex"),
         "/opt/homebrew/bin/codex",
         "/usr/local/bin/codex",
