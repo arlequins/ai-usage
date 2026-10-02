@@ -436,7 +436,8 @@ def activity_line(label: str, record: dict[str, Any] | None) -> str | None:
         period = f"week of {record['week']}"
     elif not period and record.get("date"):
         period = str(record["date"])
-    tokens = number(metrics.get("totalTokens"))
+    token_value = metrics.get("totalTokens")
+    tokens = number(token_value)
     cost = next((metrics[key] for key in ("totalCostUSD", "totalCost", "costUSD") if isinstance(metrics.get(key), (int, float))), None)
     details: list[str] = []
     if period:
@@ -456,7 +457,7 @@ def activity_line(label: str, record: dict[str, Any] | None) -> str | None:
     output_tokens = number(metrics.get("outputTokens"))
     if input_tokens or output_tokens:
         line += f" (in {input_tokens or '?'} / out {output_tokens or '?'})"
-    if tokens and tokens >= 1_000_000_000:
+    if isinstance(token_value, (int, float)) and not isinstance(token_value, bool) and token_value >= 1_000_000_000:
         line += " ⚠ unusually large local-log total; verify ccusage output"
     return line
 
