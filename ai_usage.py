@@ -86,11 +86,11 @@ def claude_data() -> dict[str, Any]:
 
 def codex_data() -> dict[str, Any]:
     try:
-        weekly = command_json(["ccusage", "codex", "weekly", "--json"])
+        daily = command_json(["ccusage", "codex", "daily", "--json"])
         return {
             "source": "ccusage local logs (activity, not plan quota)",
             "captured_at": now().isoformat(timespec="minutes"),
-            "weekly": weekly,
+            "daily": daily,
         }
     except FileNotFoundError:
         return {"source": "unavailable", "error": "ccusage is not installed"}
