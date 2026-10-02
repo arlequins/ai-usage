@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
 import os
 import plistlib
+import sqlite3
 import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -116,12 +119,68 @@ def codex_data() -> dict[str, Any]:
         return {"source": "unavailable", "error": str(e)}
 
 
+def cursor_app_session() -> str | None:
+    """Read Cursor's existing session token without modifying its local database."""
+    database = Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if not database.is_file():
+        return None
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=0.5)
+        row = connection.execute(
+            "SELECT value FROM ItemTable WHERE key = ? LIMIT 1", ("cursorAuth/accessToken",)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        if connection:
+            connection.close()
+    if not row or row[0] is None:
+        return None
+    value = row[0]
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                value = value.decode("utf-16-le")
+            except UnicodeDecodeError:
+                return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip().strip('"')
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            value = parsed.get("accessToken") or parsed.get("token") or value
+    except json.JSONDecodeError:
+        pass
+    if not isinstance(value, str) or value.count(".") < 2:
+        return None
+    try:
+        payload = value.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        subject = claims.get("sub", "")
+        expires = claims.get("exp")
+        user_id = subject.rsplit("|", 1)[-1]
+        if not user_id or not isinstance(expires, (int, float)) or expires <= dt.datetime.now(dt.timezone.utc).timestamp() + 60:
+            return None
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return f"{urllib.parse.quote(user_id, safe='')}%3A%3A{value}"
+
+
 def cursor_data() -> dict[str, Any]:
     session_token = setting("CURSOR_SESSION_TOKEN")
+    source = "Cursor dashboard session (unofficial; IDE plan usage)"
+    if not session_token:
+        session_token = cursor_app_session() or ""
+        source = "Cursor.app session (unofficial; IDE plan usage)"
     if not session_token:
         return {
             "source": "not configured",
-            "status": "Cursor User API keys are for Cloud Agents, not IDE plan usage. Enable Cursor in CodexBar or configure a signed-in dashboard session.",
+            "status": "No valid Cursor session found. Open Cursor and sign in, or set CURSOR_SESSION_TOKEN in ~/.config/ai-usage/environment.",
         }
 
     req = urllib.request.Request(
@@ -133,47 +192,103 @@ def cursor_data() -> dict[str, Any]:
             summary = json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"source": "Cursor dashboard session (unofficial)", "error": "Cursor rejected the session token. Copy a fresh WorkosCursorSessionToken from the signed-in dashboard."}
-        return {"source": "Cursor dashboard session (unofficial)", "error": f"Cursor usage request failed: HTTP {e.code} {e.reason}"}
+            return {"source": source, "error": "Cursor rejected the session. Open Cursor or the dashboard to refresh sign-in, then try again."}
+        return {"source": source, "error": f"Cursor usage request failed: HTTP {e.code} {e.reason}"}
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        return {"source": "Cursor dashboard session (unofficial)", "error": f"Cursor usage request failed: {e}"}
+        return {"source": source, "error": f"Cursor usage request failed: {e}"}
 
     return {
-        "source": "Cursor dashboard session (unofficial; IDE plan usage)",
+        "source": source,
         "captured_at": now().isoformat(timespec="minutes"),
         "usage": summary,
     }
 
 
-def codexbar_executable() -> str | None:
+def codex_executable() -> str | None:
     candidates = [
-        shutil.which("codexbar"),
-        "/opt/homebrew/bin/codexbar",
-        "/usr/local/bin/codexbar",
-        "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
+        shutil.which("codex"),
+        str(Path.home() / ".local" / "bin" / "codex"),
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex",
     ]
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
-def codexbar_data() -> dict[str, Any] | None:
-    """Read quota windows and pacing from CodexBar when it is installed."""
-    executable = codexbar_executable()
+def codex_quota_data() -> dict[str, Any]:
+    """Ask Codex app-server for the signed-in account's rate-limit windows."""
+    executable = codex_executable()
     if not executable:
-        return None
+        return {"error": "Codex CLI was not found; install or sign in to Codex CLI to read plan limits."}
+    requests = [
+        {"method": "initialize", "id": 1, "params": {"clientInfo": {"name": "ai-usage", "version": "1.0.0"}, "capabilities": {"experimentalApi": True}}},
+        {"method": "initialized"},
+        {"method": "account/rateLimits/read", "id": 2, "params": {}},
+    ]
     try:
-        return command_json([executable, "dashboard", "--identity", "redacted"], timeout=15)
-    except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
-        return {"error": str(e)}
+        proc = subprocess.run(
+            [executable, "-s", "read-only", "-a", "never", "app-server"],
+            input="".join(json.dumps(item) + "\n" for item in requests),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"Codex app-server could not read plan limits: {e}"}
+    response = None
+    for line in proc.stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("id") == 2:
+            response = item
+            break
+    if response is None:
+        detail = proc.stderr.strip() or f"Codex app-server exited with status {proc.returncode} without a quota response."
+        return {"error": detail[:300]}
+    if response.get("error"):
+        error = response["error"]
+        message = error.get("message", "quota request failed") if isinstance(error, dict) else str(error)
+        return {"error": f"Codex app-server quota request failed: {message[:250]}"}
+    payload = response.get("result")
+    if not isinstance(payload, dict):
+        return {"error": "Codex app-server returned an unexpected quota response."}
+    return normalize_codex_quota(payload)
 
 
-def quota_rows(snapshot: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("providers"), list):
-        return {}
-    return {
-        row["id"]: row
-        for row in snapshot["providers"]
-        if isinstance(row, dict) and isinstance(row.get("id"), str)
-    }
+def normalize_codex_quota(payload: dict[str, Any]) -> dict[str, Any]:
+    rate_limits = payload.get("rateLimits")
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        by_id = payload.get("rateLimitsByLimitId")
+        rate_limits = by_id.get("codex", {}) if isinstance(by_id, dict) else {}
+    windows: list[dict[str, Any]] = []
+    for key in ("primary", "secondary"):
+        limit = rate_limits.get(key) if isinstance(rate_limits, dict) else None
+        if not isinstance(limit, dict):
+            continue
+        used = limit.get("usedPercent")
+        if not isinstance(used, (int, float)):
+            continue
+        minutes = limit.get("windowDurationMins")
+        if isinstance(minutes, (int, float)):
+            label = "5-hour" if minutes <= 360 else "Weekly" if minutes <= 10080 else "Monthly"
+        else:
+            label = "Session" if key == "primary" else "Weekly"
+        reset_at = limit.get("resetsAt")
+        if isinstance(reset_at, (int, float)):
+            reset_at = dt.datetime.fromtimestamp(reset_at, dt.timezone.utc).isoformat()
+        windows.append({"label": label, "usedPercent": used, "remainingPercent": max(0, 100 - used), "resetAt": reset_at})
+    if not windows:
+        return {"error": "Codex is signed in, but no plan quota windows were returned."}
+    snapshot: dict[str, Any] = {"windows": windows}
+    plan = rate_limits.get("planType") if isinstance(rate_limits, dict) else None
+    if plan:
+        snapshot["identity"] = {"plan": plan}
+    credits = payload.get("rateLimitResetCredits")
+    if isinstance(credits, dict) and credits.get("availableCount") is not None:
+        snapshot["credits"] = {"remaining": credits["availableCount"], "unit": "resets"}
+    return snapshot
 
 
 def service_data(service: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -194,49 +309,25 @@ def service_data(service: str, config: dict[str, Any]) -> dict[str, Any]:
     return data or {"source": "not configured", "status": "No automatic source or snapshot is configured."}
 
 
-def has_quota_data(row: dict[str, Any]) -> bool:
-    windows = row.get("windows")
-    has_window = isinstance(windows, list) and any(
-        isinstance(window, dict)
-        and not window.get("idle")
-        and any(window.get(key) is not None for key in ("usedPercent", "remainingPercent", "resetAt"))
-        for window in windows
-    )
-    return bool(
-        has_window
-        or (isinstance(row.get("pace"), dict) and bool(row["pace"]))
-        or (isinstance(row.get("credits"), dict) and bool(row["credits"]))
-    )
-
-
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"generated_at": now().isoformat(timespec="minutes"), "services": {}}
-    # The providers are independent. Run local log scans and the optional quota
-    # snapshot concurrently so one slow source does not add to every other wait.
+    # Run local activity scans and the Codex quota request concurrently.
     with ThreadPoolExecutor(max_workers=4) as pool:
-        quota_future = pool.submit(codexbar_data)
+        quota_future = pool.submit(codex_quota_data)
         service_futures = {
             service: pool.submit(service_data, service, config)
             for service in ("claude", "codex", "cursor")
         }
         quota_snapshot = quota_future.result()
         service_results = {service: future.result() for service, future in service_futures.items()}
-    quotas = quota_rows(quota_snapshot)
     for service in ("claude", "codex", "cursor"):
         data = service_results[service]
-        if service in quotas and has_quota_data(quotas[service]):
-            data["quota"] = quotas[service]
-            data["quota_source"] = "CodexBar"
-        elif isinstance(quota_snapshot, dict) and quota_snapshot.get("error"):
-            data["quota_status"] = f"CodexBar quota read failed: {quota_snapshot['error']}"
-        elif quota_snapshot is None:
-            data["quota_status"] = "CodexBar CLI is not installed; plan limits and pace forecasts are unavailable."
-        else:
-            data["quota_status"] = (
-                "Cursor IDE plan data was not returned. Enable Cursor and sign in through CodexBar."
-                if service == "cursor"
-                else "No plan quota data returned by CodexBar."
-            )
+        if service == "codex":
+            if quota_snapshot.get("windows"):
+                data["quota"] = quota_snapshot
+                data["quota_source"] = "Codex app-server"
+            elif quota_snapshot.get("error"):
+                data["quota_status"] = quota_snapshot["error"]
         result["services"][service] = data
     return result
 
@@ -460,10 +551,10 @@ def render(report: dict[str, Any]) -> str:
         quota = data.get("quota")
         source = data.get("source", "unknown")
         if isinstance(quota, dict) and source == "not configured":
-            source = "CodexBar quota"
+            source = data.get("quota_source", "provider quota")
         lines.append(f"\n{title} · {source}")
         if isinstance(quota, dict):
-            lines.append("  Quota and pace · CodexBar")
+            lines.append(f"  Plan quota · {data.get('quota_source', 'provider')}")
             lines.extend(render_quota(quota))
         elif data.get("quota_status"):
             lines.append(f"  Plan quota: {data['quota_status']}")
