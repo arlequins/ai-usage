@@ -10,10 +10,13 @@ import datetime as dt
 import json
 import os
 import plistlib
+import queue
 import sqlite3
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -220,42 +223,104 @@ def codex_quota_data() -> dict[str, Any]:
     executable = codex_executable()
     if not executable:
         return {"error": "Codex CLI was not found; install or sign in to Codex CLI to read plan limits."}
-    requests = [
-        {"method": "initialize", "id": 1, "params": {"clientInfo": {"name": "ai-usage", "version": "1.0.0"}, "capabilities": {"experimentalApi": True}}},
-        {"method": "initialized"},
-        {"method": "account/rateLimits/read", "id": 2, "params": {}},
-    ]
+    messages: queue.Queue[Any] = queue.Queue()
+    stderr_tail: list[str] = []
     try:
-        proc = subprocess.run(
-            [executable, "-s", "read-only", "-a", "never", "app-server"],
-            input="".join(json.dumps(item) + "\n" for item in requests),
-            capture_output=True,
+        proc = subprocess.Popen(
+            [executable, "-s", "read-only", "-a", "never", "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=15,
-            check=False,
+            encoding="utf-8",
+            bufsize=1,
         )
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except OSError as e:
         return {"error": f"Codex app-server could not read plan limits: {e}"}
-    response = None
-    for line in proc.stdout.splitlines():
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            try:
+                messages.put(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        messages.put(None)
+
+    def read_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_tail.append(line.strip())
+            del stderr_tail[:-12]
+
+    threading.Thread(target=read_stdout, daemon=True).start()
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    def send(message: dict[str, Any]) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+    def receive(request_id: int, timeout: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                item = messages.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if item is None:
+                return None
+            if isinstance(item, dict) and item.get("id") == request_id:
+                return item
+
+    try:
+        send({"method": "initialize", "id": 1, "params": {
+            "clientInfo": {"name": "ai-usage", "title": "AI Usage", "version": "1.0.0"},
+            "capabilities": {"experimentalApi": True},
+        }})
+        initialized = receive(1, 5)
+        if initialized is None:
+            detail = "; ".join(stderr_tail[-4:])
+            return {"error": f"Codex app-server did not complete initialization{': ' + detail if detail else '.'}"}
+        if initialized.get("error"):
+            error = initialized["error"]
+            message = error.get("message", "initialization failed") if isinstance(error, dict) else str(error)
+            return {"error": f"Codex app-server initialization failed: {message[:250]}"}
+        send({"method": "initialized", "params": {}})
+        send({"method": "account/rateLimits/read", "id": 2, "params": {}})
+        response = receive(2, 10)
+        if response is None:
+            detail = "; ".join(stderr_tail[-4:])
+            return {"error": f"Codex app-server did not return quota data{': ' + detail if detail else '.'}"}
+        if response.get("error"):
+            error = response["error"]
+            message = error.get("message", "quota request failed") if isinstance(error, dict) else str(error)
+            return {"error": f"Codex app-server quota request failed: {message[:250]}"}
+        payload = response.get("result")
+        if not isinstance(payload, dict):
+            return {"error": "Codex app-server returned an unexpected quota response."}
+        return normalize_codex_quota(payload)
+    except (BrokenPipeError, OSError) as e:
+        return {"error": f"Codex app-server connection failed: {e}"}
+    finally:
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
         try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict) and item.get("id") == 2:
-            response = item
-            break
-    if response is None:
-        detail = proc.stderr.strip() or f"Codex app-server exited with status {proc.returncode} without a quota response."
-        return {"error": detail[:300]}
-    if response.get("error"):
-        error = response["error"]
-        message = error.get("message", "quota request failed") if isinstance(error, dict) else str(error)
-        return {"error": f"Codex app-server quota request failed: {message[:250]}"}
-    payload = response.get("result")
-    if not isinstance(payload, dict):
-        return {"error": "Codex app-server returned an unexpected quota response."}
-    return normalize_codex_quota(payload)
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def normalize_codex_quota(payload: dict[str, Any]) -> dict[str, Any]:
