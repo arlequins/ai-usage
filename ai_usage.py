@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -140,8 +141,77 @@ def cursor_data() -> dict[str, Any]:
     }
 
 
+def codexbar_data() -> dict[str, Any] | None:
+    """Read quota windows and pacing from CodexBar when it is installed."""
+    candidates = [
+        shutil.which("codexbar"),
+        "/opt/homebrew/bin/codexbar",
+        "/usr/local/bin/codexbar",
+        "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
+    ]
+    executable = next((path for path in candidates if path and Path(path).is_file()), None)
+    if not executable:
+        return None
+    try:
+        return command_json([executable, "dashboard", "--identity", "redacted"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
+        return {"error": str(e)}
+
+
+def quota_rows(snapshot: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("providers"), list):
+        return {}
+    return {
+        row["id"]: row
+        for row in snapshot["providers"]
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    }
+
+
+def codexbar_pace(executable: str, provider: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            [executable, "usage", "--provider", provider, "--no-color"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode:
+        return []
+    lines = []
+    window_label = "Usage"
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith(("Session:", "Weekly:", "Monthly:", "Auto:", "API:", "5-hour:")):
+            window_label = line.partition(":")[0]
+        elif line.startswith("Pace:"):
+            detail = line.partition(":")[2].strip()
+            if detail:
+                lines.append(f"{window_label}: {detail}")
+            window_label = "Usage"
+    return lines
+
+
 def collect(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"generated_at": now().isoformat(timespec="minutes"), "services": {}}
+    quota_snapshot = codexbar_data()
+    quotas = quota_rows(quota_snapshot)
+    if isinstance(quota_snapshot, dict) and not quota_snapshot.get("error"):
+        candidates = [
+            shutil.which("codexbar"),
+            "/opt/homebrew/bin/codexbar",
+            "/usr/local/bin/codexbar",
+            "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
+        ]
+        executable = next((path for path in candidates if path and Path(path).is_file()), None)
+        if executable:
+            for provider in quotas:
+                summaries = codexbar_pace(executable, provider)
+                if summaries:
+                    quotas[provider]["paceSummaries"] = summaries
     for service in ("claude", "codex", "cursor"):
         try:
             configured = run_configured(service, config)
@@ -159,6 +229,15 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
             data = cursor_data()
         if data is None:
             data = {"source": "not configured", "status": "No automatic source or snapshot is configured."}
+        if service in quotas:
+            data["quota"] = quotas[service]
+            data["quota_source"] = "CodexBar"
+        elif isinstance(quota_snapshot, dict) and quota_snapshot.get("error"):
+            data["quota_status"] = f"CodexBar quota read failed: {quota_snapshot['error']}"
+        elif quota_snapshot is None:
+            data["quota_status"] = "CodexBar CLI is not installed; plan limits and pace forecasts are unavailable."
+        else:
+            data["quota_status"] = "Provider is not enabled or returned no quota data in CodexBar."
         result["services"][service] = data
     return result
 
@@ -188,6 +267,87 @@ def summarize(value: Any, depth: int = 0) -> list[str]:
     return [str(value)]
 
 
+def progress_bar(remaining: float, width: int = 10) -> str:
+    filled = max(0, min(width, round(width * remaining / 100)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    value = max(0, int(seconds))
+    days, value = divmod(value, 86400)
+    hours, value = divmod(value, 3600)
+    minutes = value // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def reset_label(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        reset_at = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=dt.timezone.utc)
+        local = reset_at.astimezone()
+        seconds = (local - now()).total_seconds()
+        return f"{duration(seconds)} / {local.strftime('%a %H:%M')}"
+    except ValueError:
+        return value
+
+
+def render_quota(row: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    windows = row.get("windows", [])
+    if not isinstance(windows, list):
+        windows = []
+    for window in windows:
+        if not isinstance(window, dict) or window.get("idle"):
+            continue
+        label = window.get("label") or window.get("kind") or "Usage"
+        used = window.get("usedPercent")
+        remaining = window.get("remainingPercent")
+        if not isinstance(remaining, (int, float)) and isinstance(used, (int, float)):
+            remaining = 100 - used
+        if isinstance(remaining, (int, float)):
+            lines.append(f"  {label:<10} {progress_bar(remaining)}  {remaining:.0f}% remaining")
+        reset = reset_label(window.get("resetAt"))
+        if reset:
+            lines.append(f"  Reset      {reset}")
+
+    pace = row.get("pace")
+    if isinstance(pace, dict):
+        for key, label in (("primary", "Pace"), ("secondary", "Weekly pace"), ("tertiary", "Other pace")):
+            detail = pace.get(key)
+            if not isinstance(detail, dict):
+                continue
+            will_last = detail.get("willLastToReset")
+            eta = detail.get("etaSeconds")
+            summary = detail.get("summary")
+            if will_last is False and isinstance(eta, (int, float)):
+                lines.append(f"  ⚠ {label}: projected empty in {duration(eta)}")
+            elif will_last is True:
+                lines.append(f"  ✓ {label}: pace is sufficient through reset")
+            elif isinstance(summary, str) and summary:
+                lines.append(f"  {label}: {summary}")
+    for summary in row.get("paceSummaries", []):
+        if isinstance(summary, str):
+            lines.append(f"  Pace: {summary}")
+
+    identity = row.get("identity")
+    if isinstance(identity, dict) and identity.get("plan"):
+        lines.insert(0, f"  Plan       {identity['plan']}")
+    credits = row.get("credits")
+    if isinstance(credits, dict) and credits.get("remaining") is not None:
+        unit = credits.get("unit", "credits")
+        lines.append(f"  Credits    {credits['remaining']} {unit} remaining")
+    return lines
+
+
 def render(report: dict[str, Any]) -> str:
     stamp = dt.datetime.fromisoformat(report["generated_at"]).strftime("%Y-%m-%d %H:%M %Z")
     lines = [f"🤖 AI Usage — {stamp}"]
@@ -195,13 +355,19 @@ def render(report: dict[str, Any]) -> str:
     for service, title in titles.items():
         data = report["services"][service]
         lines.append(f"\n{title} · {data.get('source', 'unknown')}")
+        quota = data.get("quota")
+        if isinstance(quota, dict):
+            lines.append("  Quota and pace · CodexBar")
+            lines.extend(render_quota(quota))
+        elif data.get("quota_status"):
+            lines.append(f"  Quota: {data['quota_status']}")
         if data.get("error"):
             lines.append(f"  ⚠ {data['error']}")
             continue
         if data.get("status"):
             lines.append(f"  {data['status']}")
             continue
-        if service == "cursor" and "usage" in data:
+        if service == "cursor" and "usage" in data and not quota:
             usage = data["usage"]
             plan = usage.get("individualUsage", {}).get("plan", {})
             if plan:

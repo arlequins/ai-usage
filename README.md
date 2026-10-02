@@ -10,6 +10,10 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 | Codex | `ccusage codex daily --json` | Reads local Codex logs for activity/token/cost. This is not the official plan quota or remaining-limit value. The Codex CLI `/status` is interactive. |
 | Cursor | Cursor dashboard `GET /api/usage-summary` with a signed-in session cookie | Reports IDE plan usage pools and billing cycle. This endpoint is undocumented and may change. |
 
+When [CodexBar](https://github.com/steipete/CodexBar) is installed, `ai-usage` also reads its quota snapshot for all three providers. This adds remaining percentages, reset countdowns, and pace-based depletion forecasts while keeping the local Claude/Codex activity totals. CodexBar reuses existing sign-ins and can obtain Cursor usage from Cursor.app or browser sessions, so a manually copied Cursor session token is not required.
+
+Install CodexBar with `brew install --cask codexbar`, open it once, and enable Claude, Codex, and Cursor under Settings → Providers. Its CLI data source is read-only; `ai-usage` does not read or store provider credentials when using this path. The pace forecast compares current quota use with the elapsed reset window; it is an estimate, not a guarantee of future usage.
+
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:
 
 ```toml
@@ -19,13 +23,13 @@ argv = ["my-codex-usage-exporter", "--json"]
 
 The command may return any JSON value; it is included in the report as returned. Do not put secrets in command arguments.
 
-Cursor's User API key from Dashboard → API & SSH Keys is for Cloud Agents; it does not provide IDE plan usage. The dashboard itself exposes a usage summary through an undocumented endpoint. To use it, copy the `WorkosCursorSessionToken` cookie from a signed-in `https://cursor.com/dashboard/usage` session using Chrome DevTools → Application → Cookies → `https://cursor.com`, then add it to `~/.config/ai-usage/environment`:
+If CodexBar is unavailable, Cursor can still use the dashboard's undocumented usage-summary endpoint. Cursor's User API key from Dashboard → API & SSH Keys is for Cloud Agents; it does not provide IDE plan usage. As a fallback, copy the `WorkosCursorSessionToken` cookie from a signed-in `https://cursor.com/dashboard/usage` session using Chrome DevTools → Application → Cookies → `https://cursor.com`, then add it to `~/.config/ai-usage/environment`:
 
 ```sh
 CURSOR_SESSION_TOKEN=your_workos_cursor_session_token
 ```
 
-Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. This value is a sensitive login session credential: do not share it or commit it. It can expire; if Cursor returns 401, copy a fresh cookie from the dashboard. The collector only requests the current usage summary and does not fetch Cloud Agent activity.
+Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. This value is a sensitive login session credential: do not share it or commit it. It can expire; if Cursor returns 401, copy a fresh cookie from the dashboard. The fallback reports current usage but does not provide pace history.
 
 ## Install
 
@@ -82,6 +86,7 @@ Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with th
 - Local source: `~/.claude` usage logs through `ccusage` (ccusage must be installed separately).
 - Manual snapshots and config stay on the Mac.
 - Cursor dashboard collection uses an undocumented endpoint and a sensitive browser session token; Cursor may change the endpoint or expire the token.
+- Optional quota context and pace projections come from CodexBar's read-only CLI snapshot; provider credentials remain managed by CodexBar.
 - Slack delivery sends the rendered digest to the configured Incoming Webhook.
 - Provider commands run as the current user. Configure only commands you trust.
 - `launchd` logs are written to `~/Library/Logs/ai-usage/`.
