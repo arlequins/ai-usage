@@ -108,17 +108,67 @@ def claude_data() -> dict[str, Any]:
         return {"source": "unavailable", "error": str(e)}
 
 
-def claude_quota_data() -> dict[str, Any]:
-    """Read Claude Code plan limits using its current OAuth token, without refreshing it."""
+def claude_oauth_credentials() -> tuple[dict[str, Any] | None, str | None]:
+    """Read existing Claude Code credentials from its config file or macOS Keychain."""
     credentials_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser()
     credentials_path = credentials_dir / ".credentials.json"
+    expired_credentials: dict[str, Any] | None = None
+
+    def select_oauth(value: Any) -> dict[str, Any] | None:
+        nonlocal expired_credentials
+        oauth = value.get("claudeAiOauth") if isinstance(value, dict) else None
+        if not isinstance(oauth, dict) or not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"]:
+            return None
+        expires_at = oauth.get("expiresAt")
+        if isinstance(expires_at, (int, float)) and expires_at <= dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + 60_000:
+            expired_credentials = oauth
+            return None
+        return oauth
+
     try:
-        credentials = json.loads(credentials_path.read_text())
+        oauth = select_oauth(json.loads(credentials_path.read_text()))
+        if oauth:
+            return oauth, None
     except (OSError, json.JSONDecodeError):
-        return {"error": "Claude Code OAuth credentials were not found. Sign in to Claude Code first."}
-    oauth = credentials.get("claudeAiOauth", {}) if isinstance(credentials, dict) else {}
-    access_token = oauth.get("accessToken") if isinstance(oauth, dict) else None
-    expires_at = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        pass
+
+    if sys.platform == "darwin":
+        security = shutil.which("security") or "/usr/bin/security"
+        try:
+            proc = subprocess.run(
+                [security, "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            try:
+                stored = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                stored = None
+            oauth = select_oauth(stored)
+            if oauth:
+                return oauth, None
+
+    if expired_credentials:
+        return expired_credentials, None
+
+    if sys.platform == "darwin" and proc is None:
+        return None, "Claude Code credentials could not be read from macOS Keychain. Open Claude Code and unlock your login keychain."
+
+    return None, "Claude Code OAuth credentials were not found in the local file or macOS Keychain. Open Claude Code and sign in first."
+
+
+def claude_quota_data() -> dict[str, Any]:
+    """Read Claude Code plan limits using its current OAuth token, without refreshing it."""
+    oauth, credential_error = claude_oauth_credentials()
+    if oauth is None:
+        return {"error": credential_error or "Claude Code OAuth credentials were not found. Open Claude Code and sign in first."}
+    access_token = oauth.get("accessToken")
+    expires_at = oauth.get("expiresAt")
     if not isinstance(access_token, str) or not access_token:
         return {"error": "Claude Code OAuth token was not found in its local credentials."}
     if isinstance(expires_at, (int, float)) and expires_at <= dt.datetime.now(dt.timezone.utc).timestamp() * 1000 + 60_000:
@@ -179,7 +229,7 @@ def claude_quota_data() -> dict[str, Any]:
         return {"error": "Claude returned no plan usage windows for this account."}
 
     quota: dict[str, Any] = {"windows": windows}
-    plan = (oauth.get("subscriptionType") or oauth.get("rateLimitTier")) if isinstance(oauth, dict) else None
+    plan = oauth.get("subscriptionType") or oauth.get("rateLimitTier")
     if plan:
         quota["identity"] = {"plan": plan}
     return {"quota": quota, "source": "Claude Code usage endpoint (unofficial)"}
