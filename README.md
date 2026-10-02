@@ -62,6 +62,13 @@ ai-usage --slack
 
 The environment file can also be used by the scheduled `launchd` job. Bot credentials take precedence when both bot and webhook credentials are configured.
 
+Slack messages contain a short usage summary rather than the full terminal report. The default language is English. To switch the Slack summary to Japanese, add `language = "ja"` under the existing `[slack]` section in `~/.config/ai-usage/config.toml`. If there is no `[slack]` section yet, add:
+
+```toml
+[slack]
+language = "ja" # Use "en" for English
+```
+
 Incoming Webhooks are also supported as an alternative. Add a Slack Incoming Webhook URL to `~/.config/ai-usage/config.toml`:
 
 ```toml
