@@ -1093,35 +1093,44 @@ def render(report: dict[str, Any], color: bool = False) -> str:
 
 
 def render_slack(report: dict[str, Any], language: str = "en") -> str:
-    """Render a compact Slack-only summary in English or Japanese."""
+    """Render a concise Slack summary with quota usage and reset timing."""
     if language not in ("en", "ja"):
         raise RuntimeError("Slack language must be 'en' or 'ja'")
 
-    def remaining_percent(window: dict[str, Any]) -> float | None:
-        remaining = window.get("remainingPercent")
-        if isinstance(remaining, (int, float)):
-            return max(0.0, min(100.0, float(remaining)))
+    def used_percent(window: dict[str, Any]) -> float | None:
         used = window.get("usedPercent")
         if isinstance(used, (int, float)):
-            return max(0.0, min(100.0, 100.0 - float(used)))
+            return max(0.0, min(100.0, float(used)))
+        remaining = window.get("remainingPercent")
+        if isinstance(remaining, (int, float)):
+            return max(0.0, min(100.0, 100.0 - float(remaining)))
         return None
 
-    def reset_in(value: Any) -> str | None:
+    def local_reset(value: Any) -> dt.datetime | None:
         reset_at = parsed_time(value)
-        if not reset_at:
+        return reset_at.astimezone() if reset_at else None
+
+    def date_label(value: dt.datetime | None) -> str:
+        if value is None:
+            return "不明" if language == "ja" else "unknown"
+        if language == "ja":
+            return f"{value.month}月{value.day}日 {value:%H:%M}"
+        return f"{value:%b} {value.day}, {value:%H:%M}"
+
+    def pace_label(used: Any, reset_at: dt.datetime | None, span: Any) -> str | None:
+        if not isinstance(used, (int, float)) or used <= 0 or used >= 100:
             return None
-        seconds = max(0, (reset_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
-        if language == "en":
-            return duration(seconds)
-        value = int(seconds)
-        days, value = divmod(value, 86400)
-        hours, value = divmod(value, 3600)
-        minutes = value // 60
-        if days:
-            return f"{days}日 {hours}時間"
-        if hours:
-            return f"{hours}時間 {minutes}分"
-        return f"{minutes}分"
+        if reset_at is None or not isinstance(span, (int, float)):
+            return None
+        seconds_to_reset = (reset_at - dt.datetime.now().astimezone()).total_seconds()
+        elapsed = float(span) - seconds_to_reset
+        if seconds_to_reset <= 0 or elapsed < 60:
+            return None
+        eta = (100.0 - float(used)) * elapsed / float(used)
+        if eta < seconds_to_reset:
+            depletion = date_label(dt.datetime.now().astimezone() + dt.timedelta(seconds=eta))
+            return f"⚠ 推定枯渇 {depletion}" if language == "ja" else f"⚠ Est. depletion {depletion}"
+        return "✓ リセットまで十分" if language == "ja" else "✓ Enough through reset"
 
     generated = parsed_time(report.get("generated_at")) or now()
     local_stamp = generated.astimezone()
@@ -1130,83 +1139,50 @@ def render_slack(report: dict[str, Any], language: str = "en") -> str:
         if language == "ja" else local_stamp.strftime("%b %d, %H:%M")
     )
     heading = "🤖 AI利用状況" if language == "ja" else "🤖 AI Usage"
-    lines = [f"{heading} · {stamp}"]
+    lines = [f"*{heading}* · {stamp}"]
     services = report.get("services", {})
 
-    for service, title in (("claude", "Claude"), ("codex", "Codex"), ("cursor", "Cursor")):
-        data = services.get(service, {}) if isinstance(services, dict) else {}
-        quota = data.get("quota") if isinstance(data, dict) else None
-        windows = quota.get("windows", []) if isinstance(quota, dict) else []
-        windows = [window for window in windows if isinstance(window, dict)] if isinstance(windows, list) else []
-
-        if service in ("claude", "codex") and windows:
-            short_label = "5時間" if language == "ja" else "5h"
-            weekly_label = "週間" if language == "ja" else "weekly"
-            primary = next((w for w in windows if w.get("label") in ("5-hour", "Session")), None)
-            weekly = next((w for w in windows if w.get("label") == "Weekly"), None)
-            parts: list[str] = []
-            if primary and remaining_percent(primary) is not None:
-                left = remaining_percent(primary)
-                parts.append(f"{short_label} {left:.0f}%{'残' if language == 'ja' else ' left'}")
-            if weekly:
-                remaining = remaining_percent(weekly)
-                reset = reset_in(weekly.get("resetAt"))
-                if remaining is not None and remaining <= 0:
-                    if language == "ja":
-                        weekly_status = f"{weekly_label} 上限到達"
-                        if reset:
-                            weekly_status += f" · {reset}後にリセット"
-                    else:
-                        weekly_status = f"{weekly_label} exhausted"
-                        if reset:
-                            weekly_status += f" · resets in {reset}"
-                    parts.append(weekly_status)
-                elif remaining is not None:
-                    summary = f"{weekly_label} {remaining:.0f}%{'残' if language == 'ja' else ' left'}"
-                    if reset:
-                        summary += f" · {reset}{'後にリセット' if language == 'ja' else ' to reset'}"
-                    parts.append(summary)
-            if service == "codex" and weekly:
-                used = weekly.get("usedPercent")
-                reset_at = weekly.get("resetAt")
-                span = weekly.get("windowDurationSeconds")
-                reset_dt = parsed_time(reset_at)
-                if isinstance(used, (int, float)) and used > 0 and reset_dt and isinstance(span, (int, float)):
-                    until_reset = (reset_dt - dt.datetime.now(dt.timezone.utc)).total_seconds()
-                    elapsed = span - until_reset
-                    if elapsed >= 60 and until_reset > 0:
-                        eta = max(0.0, (100 - min(100.0, float(used))) * elapsed / float(used))
-                        if eta < until_reset:
-                            pace = duration(eta)
-                            if language == "ja":
-                                days, rest = divmod(int(eta), 86400)
-                                hours = rest // 3600
-                                pace = f"{days}日{hours}時間" if days else f"{hours}時間" if hours else f"{max(1, int(eta // 60))}分"
-                                parts.append(f"⚠ 現在のペースでは約{pace}で上限到達")
-                            else:
-                                parts.append(f"⚠ may run out in {pace}")
-            lines.append(f"{title}: " + (" · ".join(parts) if parts else ("利用量を取得できません" if language == "ja" else "quota unavailable")))
-            continue
-
-        if service == "cursor" and isinstance(data, dict):
-            usage = data.get("usage", {})
-            plan = usage.get("individualUsage", {}).get("plan", {}) if isinstance(usage, dict) else {}
-            used = plan.get("totalPercentUsed") if isinstance(plan, dict) else None
-            remaining = max(0.0, min(100.0, 100.0 - used)) if isinstance(used, (int, float)) else None
-            reset = reset_in(usage.get("billingCycleEnd")) if isinstance(usage, dict) else None
-            if remaining is not None:
-                if language == "ja":
-                    suffix = f" · {reset}後にリセット" if reset else ""
-                    lines.append(f"Cursor: 残り{remaining:.1f}%{suffix}")
-                else:
-                    suffix = f" · resets in {reset}" if reset else ""
-                    lines.append(f"Cursor: {remaining:.1f}% left{suffix}")
-                continue
-
-        if language == "ja":
-            lines.append(f"{title}: 利用量を取得できません")
+    claude = services.get("claude", {}) if isinstance(services, dict) else {}
+    claude_quota = claude.get("quota") if isinstance(claude, dict) else None
+    claude_windows = claude_quota.get("windows", []) if isinstance(claude_quota, dict) else []
+    claude_windows = [w for w in claude_windows if isinstance(w, dict)] if isinstance(claude_windows, list) else []
+    weekly = next((w for w in claude_windows if w.get("label") == "Weekly"), None)
+    if weekly:
+        used = used_percent(weekly)
+        reset_at = local_reset(weekly.get("resetAt"))
+        if used is None:
+            claude_line = "利用量を取得できません" if language == "ja" else "Usage unavailable"
         else:
-            lines.append(f"{title}: quota unavailable")
+            usage = f"{used:.0f}%使用" if language == "ja" else f"{used:.0f}% used"
+            reset_text = f"リセット {date_label(reset_at)}" if language == "ja" else f"Reset {date_label(reset_at)}"
+            details = [f"週間 {usage}" if language == "ja" else f"Weekly {usage}", reset_text]
+            pace = pace_label(used, reset_at, weekly.get("windowDurationSeconds"))
+            if pace:
+                details.append(pace)
+            claude_line = " · ".join(details)
+    else:
+        claude_line = "利用量を取得できません" if language == "ja" else "Usage unavailable"
+    lines.append(f"• *Claude*  {claude_line}")
+
+    cursor = services.get("cursor", {}) if isinstance(services, dict) else {}
+    cursor_usage = cursor.get("usage", {}) if isinstance(cursor, dict) else {}
+    cursor_plan = cursor_usage.get("individualUsage", {}).get("plan", {}) if isinstance(cursor_usage, dict) else {}
+    cursor_used = cursor_plan.get("totalPercentUsed") if isinstance(cursor_plan, dict) else None
+    cursor_reset = local_reset(cursor_usage.get("billingCycleEnd")) if isinstance(cursor_usage, dict) else None
+    if isinstance(cursor_used, (int, float)):
+        used = max(0.0, min(100.0, float(cursor_used)))
+        usage = f"{used:.1f}%使用" if language == "ja" else f"{used:.1f}% used"
+        reset_text = f"リセット {date_label(cursor_reset)}" if language == "ja" else f"Reset {date_label(cursor_reset)}"
+        details = [usage, reset_text]
+        cycle_start = parsed_time(cursor_usage.get("billingCycleStart"))
+        span = (cursor_reset - cycle_start.astimezone()).total_seconds() if cursor_reset and cycle_start else None
+        pace = pace_label(used, cursor_reset, span)
+        if pace:
+            details.append(pace)
+        cursor_line = " · ".join(details)
+    else:
+        cursor_line = "利用量を取得できません" if language == "ja" else "Usage unavailable"
+    lines.append(f"• *Cursor*  {cursor_line}")
     return "\n".join(lines)
 
 
