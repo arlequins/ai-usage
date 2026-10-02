@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime as dt
 import json
 import os
@@ -113,49 +112,31 @@ def codex_data() -> dict[str, Any]:
 
 
 def cursor_data() -> dict[str, Any]:
-    api_key = setting("CURSOR_API_KEY") or setting("CURSOR_ADMIN_API_KEY")
-    if not api_key:
-        return {"source": "not configured", "status": "Set CURSOR_API_KEY to enable Cursor User API."}
+    session_token = setting("CURSOR_SESSION_TOKEN")
+    if not session_token:
+        return {
+            "source": "not configured",
+            "status": "Set CURSOR_SESSION_TOKEN to read Cursor plan usage from your dashboard session.",
+        }
 
-    def get_json(path: str) -> Any:
-        req = urllib.request.Request(
-            f"https://api.cursor.com{path}",
-            headers={"Authorization": f"Basic {base64.b64encode(f'{api_key}:'.encode()).decode()}"},
-        )
-        with urllib.request.urlopen(req, timeout=20) as response:
-            return json.loads(response.read().decode())
-
+    req = urllib.request.Request(
+        "https://cursor.com/api/usage-summary",
+        headers={"Cookie": f"WorkosCursorSessionToken={session_token}"},
+    )
     try:
-        identity = get_json("/v1/me")
-        agents = get_json("/v1/agents?limit=20&includeArchived=true")
+        with urllib.request.urlopen(req, timeout=20) as response:
+            summary = json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"source": "Cursor User API", "error": "Cursor rejected the API key. Check that it is the User API key shown in Cursor Dashboard → API & SSH Keys."}
-        return {"source": "Cursor User API", "error": f"Cursor API request failed: HTTP {e.code} {e.reason}"}
+            return {"source": "Cursor dashboard session (unofficial)", "error": "Cursor rejected the session token. Copy a fresh WorkosCursorSessionToken from the signed-in dashboard."}
+        return {"source": "Cursor dashboard session (unofficial)", "error": f"Cursor usage request failed: HTTP {e.code} {e.reason}"}
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        return {"source": "Cursor User API", "error": f"Cursor API request failed: {e}"}
+        return {"source": "Cursor dashboard session (unofficial)", "error": f"Cursor usage request failed: {e}"}
 
-    totals = {"inputTokens": 0, "outputTokens": 0, "cacheWriteTokens": 0, "cacheReadTokens": 0, "totalTokens": 0}
-    scanned = 0
-    failed = 0
-    for agent in agents.get("items", []):
-        try:
-            usage = get_json(f"/v1/agents/{agent['id']}/usage").get("totalUsage", {})
-            for field in totals:
-                totals[field] += usage.get(field, 0) or 0
-            scanned += 1
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError):
-            failed += 1
     return {
-        "source": "Cursor User API · Cloud Agent usage (latest 20 agents; not IDE plan usage)",
+        "source": "Cursor dashboard session (unofficial; IDE plan usage)",
         "captured_at": now().isoformat(timespec="minutes"),
-        "usage": {
-            "email": identity.get("userEmail", "unknown"),
-            "agents_scanned": scanned,
-            "more_agents_available": bool(agents.get("nextCursor")),
-            "agents_failed": failed,
-            **totals,
-        },
+        "usage": summary,
     }
 
 
@@ -166,7 +147,7 @@ def collect(config: dict[str, Any]) -> dict[str, Any]:
             configured = run_configured(service, config)
         except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
             configured = {"source": "configured command failed", "error": str(e)}
-        if service == "cursor" and not configured and (setting("CURSOR_API_KEY") or setting("CURSOR_ADMIN_API_KEY")):
+        if service == "cursor" and not configured and setting("CURSOR_SESSION_TOKEN"):
             data = cursor_data()
         else:
             data = configured or snapshot(service)
@@ -222,16 +203,24 @@ def render(report: dict[str, Any]) -> str:
             continue
         if service == "cursor" and "usage" in data:
             usage = data["usage"]
-            lines.append(f"  Account: {usage['email']}")
-            lines.append(f"  Cloud agents scanned: {usage['agents_scanned']}")
-            lines.append(f"  Input tokens: {usage['inputTokens']}")
-            lines.append(f"  Output tokens: {usage['outputTokens']}")
-            lines.append(f"  Cache tokens: {usage['cacheWriteTokens'] + usage['cacheReadTokens']}")
-            lines.append(f"  Total tokens: {usage['totalTokens']}")
-            if usage.get("more_agents_available"):
-                lines.append("  Note: Only the 20 newest agents are included.")
-            if usage.get("agents_failed"):
-                lines.append(f"  Agents with unavailable usage: {usage['agents_failed']}")
+            plan = usage.get("individualUsage", {}).get("plan", {})
+            if plan:
+                used = plan.get("used")
+                limit = plan.get("limit")
+                remaining = plan.get("remaining")
+                if used is not None and limit is not None:
+                    lines.append(f"  Plan usage: {used} / {limit}")
+                if remaining is not None:
+                    lines.append(f"  Remaining: {remaining}")
+                for name, key in (("Auto / Cursor models", "autoPercentUsed"), ("API / other models", "apiPercentUsed"), ("Total", "totalPercentUsed")):
+                    percent = plan.get(key)
+                    if isinstance(percent, (int, float)):
+                        lines.append(f"  {name}: {100 - percent:.1f}% remaining")
+            if usage.get("billingCycleStart") or usage.get("billingCycleEnd"):
+                lines.append(f"  Billing cycle: {usage.get('billingCycleStart', '?')} → {usage.get('billingCycleEnd', '?')}")
+            on_demand = usage.get("individualUsage", {}).get("onDemand", {})
+            if on_demand.get("enabled"):
+                lines.append(f"  On-demand used: {on_demand.get('used', 'unknown')} (dashboard units)")
             if data.get("captured_at"):
                 lines.append(f"  Captured: {data['captured_at']}")
             continue

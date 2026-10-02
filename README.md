@@ -8,7 +8,7 @@ macOS command-line usage digest for Claude Code, Codex, and Cursor. It prints a 
 | --- | --- | --- |
 | Claude Code | `ccusage claude blocks --json` and `ccusage claude weekly --json` | Reads local Claude Code logs. These are activity/token/cost reports; they are **not** official plan quota or remaining-limit values. |
 | Codex | `ccusage codex daily --json` | Reads local Codex logs for activity/token/cost. This is not the official plan quota or remaining-limit value. The Codex CLI `/status` is interactive. |
-| Cursor | User API `/v1/me` and Cloud Agent usage endpoints | Reports token usage for the 20 newest Cloud Agents. It does not expose Cursor IDE usage or remaining plan allowance. |
+| Cursor | Cursor dashboard `GET /api/usage-summary` with a signed-in session cookie | Reports IDE plan usage pools and billing cycle. This endpoint is undocumented and may change. |
 
 Provider command output must be JSON. Commands are configured as argument arrays in `~/.config/ai-usage/config.toml`, for example:
 
@@ -19,13 +19,13 @@ argv = ["my-codex-usage-exporter", "--json"]
 
 The command may return any JSON value; it is included in the report as returned. Do not put secrets in command arguments.
 
-For Cursor Cloud Agent collection, add the User API key from Cursor Dashboard → API & SSH Keys to `~/.config/ai-usage/environment`:
+Cursor's User API key from Dashboard → API & SSH Keys is for Cloud Agents; it does not provide IDE plan usage. The dashboard itself exposes a usage summary through an undocumented endpoint. To use it, copy the `WorkosCursorSessionToken` cookie from a signed-in `https://cursor.com/dashboard/usage` session using Chrome DevTools → Application → Cookies → `https://cursor.com`, then add it to `~/.config/ai-usage/environment`:
 
 ```sh
-CURSOR_API_KEY=your_cursor_user_api_key
+CURSOR_SESSION_TOKEN=your_workos_cursor_session_token
 ```
 
-Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. The User API key can list Cloud Agents and their token usage. Cursor's public documentation directs users to the Spending dashboard for included usage pools and remaining allowance; those values are not exposed by the documented User API endpoints.
+Keep the file private with `chmod 600 ~/.config/ai-usage/environment`. This value is a sensitive login session credential: do not share it or commit it. It can expire; if Cursor returns 401, copy a fresh cookie from the dashboard. The collector only requests the current usage summary and does not fetch Cloud Agent activity.
 
 ## Install
 
@@ -75,12 +75,13 @@ ai-usage snapshot codex ~/Downloads/codex-usage.json
 ai-usage snapshot cursor ~/Downloads/cursor-usage.json
 ```
 
-Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with their capture time. They remain available if you want to record values from the Cursor Spending dashboard; the application does not scrape browser sessions.
+Snapshots are stored under `~/.config/ai-usage/snapshots/` and are shown with their capture time.
 
 ## Data and security
 
 - Local source: `~/.claude` usage logs through `ccusage` (ccusage must be installed separately).
 - Manual snapshots and config stay on the Mac.
+- Cursor dashboard collection uses an undocumented endpoint and a sensitive browser session token; Cursor may change the endpoint or expire the token.
 - Slack delivery sends the rendered digest to the configured Incoming Webhook.
 - Provider commands run as the current user. Configure only commands you trust.
 - `launchd` logs are written to `~/Library/Logs/ai-usage/`.
